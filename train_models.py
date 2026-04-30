@@ -38,13 +38,13 @@ np.random.seed(42)
 # ──────────────────────────────────────────────
 CFG = {
     'data_path'   : 'DK_Final_Research_Dataset.csv',
-    'seq_len'     : 3,          # Reduced for stability on synthetic jitter
-    'test_size'   : 0.2,
+    'seq_len'     : 5,          # Increased for better temporal context
+    'test_size'   : 0.15,
     'val_size'    : 0.15,
-    'epochs'      : 300,        # Increased epochs
-    'batch_size'  : 64,         # Larger batch for smoother gradients
-    'lr'          : 0.002,      # Higher initial LR
-    'patience'    : 50,         # More patience
+    'epochs'      : 200,        # Optimized epochs
+    'batch_size'  : 32,         # Smaller batch for better convergence
+    'lr'          : 0.001,      # Lower initial LR for stability
+    'patience'    : 40,
     'output_dir'  : 'outputs',
     'model_dir'   : 'outputs/models',
 }
@@ -109,8 +109,9 @@ def prepare_data(crop_name):
     X_raw = cdf[FEATURE_COLS].values.astype(float)
     y_raw = cdf[TARGET_COL].values.astype(float).reshape(-1, 1)
 
-    scaler_X = MinMaxScaler()
-    scaler_y = MinMaxScaler()
+    from sklearn.preprocessing import StandardScaler
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
     X_scaled = scaler_X.fit_transform(X_raw)
     y_scaled = scaler_y.fit_transform(y_raw).flatten()
 
@@ -136,71 +137,74 @@ def prepare_data(crop_name):
 # ──────────────────────────────────────────────
 # 4. MODEL ARCHITECTURES
 # ──────────────────────────────────────────────
-def get_callbacks(name):
+def get_callbacks(model_name, crop):
+    os.makedirs(os.path.join(CFG['model_dir'], 'checkpoints'), exist_ok=True)
+    cp_path = os.path.join(CFG['model_dir'], 'checkpoints', f'{model_name}_{crop.replace(" ","_")}_best.keras')
     return [
         EarlyStopping(monitor='val_loss', patience=CFG['patience'], restore_best_weights=True, verbose=0),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15, min_lr=1e-6, verbose=0),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, verbose=0),
+        ModelCheckpoint(cp_path, monitor='val_loss', save_best_only=True, verbose=0)
     ]
 
 def build_lstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        LSTM(64, return_sequences=True), BatchNormalization(), Dropout(0.1),
-        LSTM(32), BatchNormalization(), Dropout(0.1),
-        Dense(16, activation='relu'), Dense(1)
+        LSTM(128, return_sequences=True), BatchNormalization(), Dropout(0.1),
+        LSTM(64), BatchNormalization(), Dropout(0.1),
+        Dense(32, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
 def build_bilstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        Bidirectional(LSTM(64, return_sequences=True)), BatchNormalization(), Dropout(0.1),
-        Bidirectional(LSTM(32)), BatchNormalization(), Dropout(0.1),
-        Dense(16, activation='relu'), Dense(1)
+        Bidirectional(LSTM(128, return_sequences=True)), BatchNormalization(), Dropout(0.1),
+        Bidirectional(LSTM(64)), BatchNormalization(), Dropout(0.1),
+        Dense(32, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
 def build_gru(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        GRU(64, return_sequences=True), BatchNormalization(), Dropout(0.1),
-        GRU(32), BatchNormalization(), Dropout(0.1),
-        Dense(16, activation='relu'), Dense(1)
+        GRU(128, return_sequences=True), BatchNormalization(), Dropout(0.1),
+        GRU(64), BatchNormalization(), Dropout(0.1),
+        Dense(32, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
 def build_cnn_lstm(seq_len, n_features):
     inp = Input(shape=(seq_len, n_features))
-    x   = Conv1D(128, kernel_size=2, activation='relu', padding='same')(inp)
+    x   = Conv1D(128, kernel_size=3, activation='relu', padding='same')(inp)
     x   = BatchNormalization()(x)
     x   = Conv1D(64, kernel_size=2, activation='relu', padding='same')(x)
     x   = LSTM(64)(x)
-    x   = Dropout(0.2)(x)
+    x   = Dropout(0.1)(x)
     x   = Dense(32, activation='relu')(x)
     out = Dense(1)(x)
-    m   = Model(inp, out, name='CNN_LSTM'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m   = Model(inp, out, name='CNN_LSTM'); m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
-def build_transformer(seq_len, n_features, num_heads=4, ff_dim=64):
+def build_transformer(seq_len, n_features, num_heads=4, ff_dim=128):
     inp = Input(shape=(seq_len, n_features))
     x   = Dense(64)(inp)
     attn_out = MultiHeadAttention(num_heads=num_heads, key_dim=32)(x, x)
     x1  = LayerNormalization(epsilon=1e-6)(Add()([x, attn_out]))
     ff  = Dense(ff_dim, activation='relu')(x1); ff = Dense(64)(ff)
     x2  = LayerNormalization(epsilon=1e-6)(Add()([x1, ff]))
-    x3  = GlobalAveragePooling1D()(x2); x3 = Dropout(0.2)(x3); x3 = Dense(32, activation='relu')(x3); out = Dense(1)(x3)
-    m   = Model(inp, out, name='Transformer'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    x3  = GlobalAveragePooling1D()(x2); x3 = Dropout(0.1)(x3); x3 = Dense(32, activation='relu')(x3); out = Dense(1)(x3)
+    m   = Model(inp, out, name='Transformer'); m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
 def build_tcn(seq_len, n_features):
     inp = Input(shape=(seq_len, n_features))
     x = Conv1D(128, kernel_size=2, dilation_rate=1, padding='causal', activation='relu')(inp); x = BatchNormalization()(x)
     x = Conv1D(128, kernel_size=2, dilation_rate=2, padding='causal', activation='relu')(x); x = BatchNormalization()(x)
-    x = GlobalAveragePooling1D()(x); x = Dense(64, activation='relu')(x); x = Dropout(0.2)(x); out = Dense(1)(x)
-    m = Model(inp, out, name='TCN'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    x = GlobalAveragePooling1D()(x); x = Dense(64, activation='relu')(x); x = Dropout(0.1)(x); out = Dense(1)(x)
+    m = Model(inp, out, name='TCN'); m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
     return m
 
 MODEL_BUILDERS = {'LSTM': build_lstm, 'BiLSTM': build_bilstm, 'GRU': build_gru, 'CNN-LSTM': build_cnn_lstm, 'Transformer': build_transformer, 'TCN': build_tcn}
@@ -229,12 +233,22 @@ for crop in CROPS:
     print(f"\n  Crop: {crop}")
     X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y = prepare_data(crop); n_feat = X_train.shape[2]
 
+    # Save Scalers for this crop
+    joblib.dump(scaler_X, os.path.join(CFG['output_dir'], 'preprocessors', f'scaler_X_{crop.replace(" ","_")}.joblib'))
+    joblib.dump(scaler_y, os.path.join(CFG['output_dir'], 'preprocessors', f'scaler_y_{crop.replace(" ","_")}.joblib'))
+
     for model_name in MODEL_NAMES:
         model_path = os.path.join(CFG['model_dir'], f'{model_name}_{crop.replace(" ","_")}.keras')
         t0 = time.time()
         model = MODEL_BUILDERS[model_name](CFG['seq_len'], n_feat)
-        hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=CFG['epochs'], batch_size=CFG['batch_size'], callbacks=get_callbacks(model_name), verbose=0)
+        hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=CFG['epochs'], batch_size=CFG['batch_size'], callbacks=get_callbacks(model_name, crop), verbose=0)
         elapsed = round(time.time() - t0, 2)
+        
+        # Load best weights if checkpoint exists
+        best_path = os.path.join(CFG['model_dir'], 'checkpoints', f'{model_name}_{crop.replace(" ","_")}_best.keras')
+        if os.path.exists(best_path):
+            model = tf.keras.models.load_model(best_path)
+            
         model.save(model_path)
         
         train_times[model_name][crop] = elapsed
