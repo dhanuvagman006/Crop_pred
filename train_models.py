@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
 
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
@@ -109,7 +109,6 @@ def prepare_data(crop_name):
     X_raw = cdf[FEATURE_COLS].values.astype(float)
     y_raw = cdf[TARGET_COL].values.astype(float).reshape(-1, 1)
 
-    from sklearn.preprocessing import StandardScaler
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     X_scaled = scaler_X.fit_transform(X_raw)
@@ -149,8 +148,9 @@ def get_callbacks(model_name, crop):
 def build_lstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        LSTM(128, return_sequences=True), BatchNormalization(), Dropout(0.1),
-        LSTM(64), BatchNormalization(), Dropout(0.1),
+        LSTM(128, return_sequences=True), BatchNormalization(),
+        LSTM(64), BatchNormalization(),
+        Dense(64, activation='relu'), Dropout(0.2),
         Dense(32, activation='relu'), Dense(1)
     ])
     m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
@@ -159,8 +159,9 @@ def build_lstm(seq_len, n_features):
 def build_bilstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        Bidirectional(LSTM(128, return_sequences=True)), BatchNormalization(), Dropout(0.1),
-        Bidirectional(LSTM(64)), BatchNormalization(), Dropout(0.1),
+        Bidirectional(LSTM(128, return_sequences=True)), BatchNormalization(),
+        Bidirectional(LSTM(64)), BatchNormalization(),
+        Dense(64, activation='relu'), Dropout(0.2),
         Dense(32, activation='relu'), Dense(1)
     ])
     m.compile(optimizer=Adam(learning_rate=CFG['lr'], clipnorm=1.0), loss='huber', metrics=['mae'])
