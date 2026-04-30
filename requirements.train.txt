@@ -1,0 +1,5 @@
+# Training/report dependencies for train_models.py
+# TensorFlow is large; keep it separate from app requirements.
+# Note: TensorFlow wheels are OS/Python specific.
+tensorflow>=2.15
+openpyxl>=3.1
