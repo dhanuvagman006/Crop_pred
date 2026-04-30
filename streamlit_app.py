@@ -135,6 +135,21 @@ CROP_UNITS   = {'Rice':'kg/ha','Coconut':'nuts/ha','Arecanut':'kg/ha',
 MODEL_COLORS = {'LSTM':'#2196F3','BiLSTM':'#4CAF50','GRU':'#FF9800',
                 'CNN-LSTM':'#9C27B0','Transformer':'#F44336','TCN':'#00BCD4'}
 
+
+def build_features(crop_enc, weather_vals, soil_vals, area_val):
+    return np.array([[
+        weather_vals['Annual_Rainfall_mm'], weather_vals['Max_Temp_C'], weather_vals['Min_Temp_C'],
+        weather_vals['Avg_Humidity_pct'], weather_vals['Sunshine_Hours_day'], weather_vals['Wind_Speed_kmh'],
+        soil_vals['Soil_pH'], soil_vals['Nitrogen_kg_ha'], soil_vals['Phosphorus_kg_ha'],
+        soil_vals['Potassium_kg_ha'], soil_vals['Organic_Carbon_pct'], soil_vals['Soil_Moisture_pct'],
+        soil_vals['EC_dSm'], area_val, float(crop_enc),
+        weather_vals['Max_Temp_C'] - weather_vals['Min_Temp_C'],
+        weather_vals['Annual_Rainfall_mm'] / max(weather_vals['Avg_Humidity_pct'], 1e-6),
+        soil_vals['Nitrogen_kg_ha'] + soil_vals['Phosphorus_kg_ha'] + soil_vals['Potassium_kg_ha'],
+        np.log1p(area_val),
+        weather_vals['Annual_Rainfall_mm'] * weather_vals['Avg_Humidity_pct'] / 100.0,
+    ]], dtype=float)
+
 # Realistic ranges for Dakshina Kannada
 PARAM_INFO = {
     'Annual_Rainfall_mm':  {'label':'Annual Rainfall (mm)',    'min':2000, 'max':5000, 'default':3600, 'help':'DK avg: 3200–4000 mm'},
@@ -224,41 +239,22 @@ with tab1:
 
     if predict_btn:
         with st.spinner(f"Inference using {selected_model}..."):
-            # ── Deep Learning Inference ────────────────────────
+            # ── Tabular model inference ────────────────────────
             base_path = os.path.join('outputs', 'preprocessors')
             le_path   = os.path.join(base_path, 'label_encoder.joblib')
-            sc_x_path = os.path.join(base_path, f'scaler_X_{selected_crop.replace(" ","_")}.joblib')
-            sc_y_path = os.path.join(base_path, f'scaler_y_{selected_crop.replace(" ","_")}.joblib')
-            model_path = os.path.join('outputs', 'models', f"{selected_model}_{selected_crop.replace(' ','_')}.keras")
+            model_path = os.path.join('outputs', 'models', f"{selected_model}.joblib")
 
             pred_mode = 'formula'
             pred_yield = 0.0
 
-            if all(os.path.exists(p) for p in [le_path, sc_x_path, sc_y_path, model_path]):
+            if all(os.path.exists(p) for p in [le_path, model_path]):
                 try:
                     le = joblib.load(le_path)
-                    sc_x = joblib.load(sc_x_path)
-                    sc_y = joblib.load(sc_y_path)
-                    model = tf.keras.models.load_model(model_path)
+                    model = joblib.load(model_path)
                     
                     crop_enc = le.transform([selected_crop])[0]
-                    
-                    input_feat = np.array([[
-                        weather_vals['Annual_Rainfall_mm'], weather_vals['Max_Temp_C'],
-                        weather_vals['Min_Temp_C'],         weather_vals['Avg_Humidity_pct'],
-                        weather_vals['Sunshine_Hours_day'], weather_vals['Wind_Speed_kmh'],
-                        soil_vals['Soil_pH'],               soil_vals['Nitrogen_kg_ha'],
-                        soil_vals['Phosphorus_kg_ha'],      soil_vals['Potassium_kg_ha'],
-                        soil_vals['Organic_Carbon_pct'],    soil_vals['Soil_Moisture_pct'],
-                        soil_vals['EC_dSm'],                area_val,
-                        float(crop_enc)
-                    ]])
-                    
-                    X_sc = sc_x.transform(input_feat)
-                    X_seq = np.repeat(X_sc[:, np.newaxis, :], 5, axis=1)
-                    
-                    raw_pred_s = model.predict(X_seq, verbose=0).flatten()
-                    pred_yield = sc_y.inverse_transform(raw_pred_s.reshape(-1, 1)).flatten()[0]
+                    input_feat = build_features(crop_enc, weather_vals, soil_vals, area_val)
+                    pred_yield = float(np.clip(model.predict(input_feat)[0], 0, None))
                     pred_mode = 'model'
                 except Exception as e:
                     st.warning(f"Model inference failed: {e}. Falling back to heuristic.")
@@ -387,7 +383,7 @@ with tab2:
                 'Train Time (s)': '{:.2f}s',
                 'Parameters': '{:,}'
             }),
-            use_container_width=True
+            width='stretch'
         )
         
         # Other Factors

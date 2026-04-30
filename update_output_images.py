@@ -156,22 +156,21 @@ def regenerate_actual_vs_pred(detailed: pd.DataFrame) -> None:
 
 
 def regenerate_loss_curves(detailed: pd.DataFrame) -> None:
-    best_by_crop = detailed.sort_values(['Crop', 'R2'], ascending=[True, False]).groupby('Crop', as_index=False).first()
-    n = len(best_by_crop)
+    best_by_model = detailed.sort_values(['Model', 'R2'], ascending=[True, False]).groupby('Model', as_index=False).first()
+    n = len(best_by_model)
     cols = 2
     rows = int(np.ceil(n / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(14, 4 * rows))
     axes = np.array(axes).reshape(-1)
 
-    for idx, (_, row) in enumerate(best_by_crop.iterrows()):
-        crop = row['Crop']
+    for idx, (_, row) in enumerate(best_by_model.iterrows()):
         model = row['Model']
-        hist_path = HISTORY_DIR / f"{model}_{crop.replace(' ', '_')}_history.csv"
+        hist_path = HISTORY_DIR / f"{model}_history.csv"
         hist_df = _read_csv(hist_path)
         ax = axes[idx]
 
         if hist_df is None or hist_df.empty:
-            ax.text(0.5, 0.5, f'No history for {crop}\nRun training to populate {hist_path.name}',
+            ax.text(0.5, 0.5, f'No history for {model}\nRun training to populate {hist_path.name}',
                     ha='center', va='center', fontsize=10)
             ax.set_axis_off()
             continue
@@ -179,7 +178,7 @@ def regenerate_loss_curves(detailed: pd.DataFrame) -> None:
         ax.plot(hist_df['epoch'], hist_df['loss'], label='train loss', linewidth=2)
         if 'val_loss' in hist_df:
             ax.plot(hist_df['epoch'], hist_df['val_loss'], label='val loss', linewidth=2)
-        ax.set_title(f'{crop} - {model}')
+        ax.set_title(f'{model}')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
         ax.grid(alpha=0.25)

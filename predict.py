@@ -12,6 +12,20 @@ MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
 CROP_BASE   = {'Rice':2800,'Coconut':9200,'Arecanut':2100,'Banana':22000,'Black pepper':350, 'Cocoa':600, 'Cashewnut':500, 'Mango':5000}
 CROP_UNITS  = {'Rice':'kg/ha','Coconut':'nuts/ha','Arecanut':'kg/ha','Banana':'kg/ha','Black pepper':'kg/ha','Cocoa':'kg/ha','Cashewnut':'kg/ha','Mango':'kg/ha'}
 
+
+def build_features(crop_enc, weather, soil, area):
+    return np.array([[
+        weather['rainfall'], weather['max_temp'], weather['min_temp'],
+        weather['humidity'], weather['sunshine'], weather['wind'],
+        soil['ph'], soil['nitrogen'], soil['phosphorus'], soil['potassium'],
+        soil['organic_carbon'], soil['moisture'], soil['ec'], area, float(crop_enc),
+        weather['max_temp'] - weather['min_temp'],
+        weather['rainfall'] / max(weather['humidity'], 1e-6),
+        soil['nitrogen'] + soil['phosphorus'] + soil['potassium'],
+        np.log1p(area),
+        weather['rainfall'] * weather['humidity'] / 100.0,
+    ]], dtype=float)
+
 def get_float(prompt, mn, mx, default):
     while True:
         try:
@@ -37,14 +51,11 @@ def get_choice(prompt, options):
 
 def predict(crop, model_name, weather, soil, area):
     import joblib
-    import tensorflow as tf
     
     # Paths
     base_path = os.path.join('outputs', 'preprocessors')
     le_path   = os.path.join(base_path, 'label_encoder.joblib')
-    sc_x_path = os.path.join(base_path, f'scaler_X_{crop.replace(" ","_")}.joblib')
-    sc_y_path = os.path.join(base_path, f'scaler_y_{crop.replace(" ","_")}.joblib')
-    model_path = os.path.join('outputs', 'models', f"{model_name}_{crop.replace(' ','_')}.keras")
+    model_path = os.path.join('outputs', 'models', f"{model_name}.joblib")
 
     # Fallback formula params
     base_formula = CROP_BASE[crop]
@@ -55,29 +66,14 @@ def predict(crop, model_name, weather, soil, area):
     m_eff    = (soil['moisture'] - 32) / 32 * 0.04
     pred_formula = max(50.0, base_formula * (1 + rain_eff + temp_eff + n_eff + ph_eff + m_eff))
 
-    if all(os.path.exists(p) for p in [le_path, sc_x_path, sc_y_path, model_path]):
+    if all(os.path.exists(p) for p in [le_path, model_path]):
         try:
             le = joblib.load(le_path)
-            sc_x = joblib.load(sc_x_path)
-            sc_y = joblib.load(sc_y_path)
-            model = tf.keras.models.load_model(model_path)
+            model = joblib.load(model_path)
             
             crop_enc = le.transform([crop])[0]
-            
-            features = np.array([[
-                weather['rainfall'], weather['max_temp'], weather['min_temp'],
-                weather['humidity'], weather['sunshine'], weather['wind'],
-                soil['ph'], soil['nitrogen'], soil['phosphorus'],
-                soil['potassium'], soil['organic_carbon'], soil['moisture'],
-                soil['ec'], area, float(crop_enc)
-            ]])
-            
-            X_sc = sc_x.transform(features)
-            # Reshape for sequence length (5)
-            X_seq = np.repeat(X_sc[:, np.newaxis, :], 5, axis=1)
-            
-            raw_pred_s = model.predict(X_seq, verbose=0).flatten()
-            pred_val = sc_y.inverse_transform(raw_pred_s.reshape(-1, 1)).flatten()[0]
+            features = build_features(crop_enc, weather, soil, area)
+            pred_val = float(np.clip(model.predict(features)[0], 0, None))
             
             return max(50.0, float(pred_val)), 'model'
         except Exception as e:

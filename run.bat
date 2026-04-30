@@ -3,10 +3,8 @@
 title Streamlit App Runner
 
 echo Installing requirements...
-git pull origin main
 pip install -r requirements.txt
 
-python augment_data.py
 python train_models.py
 python update_output_images.py
 echo.
