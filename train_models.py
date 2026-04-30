@@ -67,6 +67,8 @@ if args.quick:
 os.makedirs(CFG['output_dir'], exist_ok=True)
 os.makedirs(CFG['model_dir'],  exist_ok=True)
 os.makedirs(os.path.join(CFG['output_dir'], 'preprocessors'), exist_ok=True)
+os.makedirs(os.path.join(CFG['output_dir'], 'histories'), exist_ok=True)
+os.makedirs(os.path.join(CFG['output_dir'], 'predictions'), exist_ok=True)
 
 CROPS        = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
 MODEL_NAMES  = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
@@ -316,9 +318,29 @@ for crop in CROPS:
         histories[model_name][crop]   = hist.history
         param_counts[model_name]      = model.count_params()
 
+        # Persist training history and predictions for later plot regeneration
+        hist_df = pd.DataFrame(hist.history)
+        hist_df.insert(0, 'epoch', np.arange(1, len(hist_df) + 1))
+        hist_df.to_csv(
+            os.path.join(CFG['output_dir'], 'histories', f'{model_name}_{crop.replace(" ","_")}_history.csv'),
+            index=False
+        )
+
         y_pred_s = model.predict(X_test, verbose=0).flatten()
         y_pred   = scaler_y.inverse_transform(y_pred_s.reshape(-1,1)).flatten()
         y_true   = scaler_y.inverse_transform(y_test.reshape(-1,1)).flatten()
+
+        pred_df = pd.DataFrame({
+            'Actual': y_true,
+            'Predicted': y_pred,
+            'Residual': y_true - y_pred,
+            'Model': model_name,
+            'Crop': crop,
+        })
+        pred_df.to_csv(
+            os.path.join(CFG['output_dir'], 'predictions', f'{model_name}_{crop.replace(" ","_")}_predictions.csv'),
+            index=False
+        )
 
         all_preds[model_name][crop] = (y_true, y_pred)
         metrics = compute_metrics(y_true, y_pred)
