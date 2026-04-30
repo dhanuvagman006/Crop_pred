@@ -55,7 +55,7 @@ def _read_csv(path: Path) -> pd.DataFrame | None:
 
 def regenerate_metric_comparison(model_comp: pd.DataFrame) -> None:
     df = model_comp.copy()
-    df = df.sort_values('Composite', ascending=False)
+    df = df.sort_values('Avg_R2', ascending=False)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 

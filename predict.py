@@ -6,11 +6,36 @@
 import numpy as np
 import os, sys
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import tensorflow as tf
+from sklearn.base import BaseEstimator, RegressorMixin
+
+# Must define the same wrapper class for joblib to load it
+class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=20):
+        self.model_type = model_type
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.n_features = n_features
+        self.model = None
+        self.history_ = None
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if 'model_bytes' in state:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
+                tmp.write(self.model_bytes)
+                tmp.flush()
+                self.model = tf.keras.models.load_model(tmp.name)
+            os.unlink(tmp.name)
+            del self.model_bytes
+    def predict(self, X):
+        X_res = np.array(X).reshape((-1, 1, self.n_features))
+        return self.model.predict(X_res, verbose=0).flatten()
 
 CROPS       = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
 MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
-CROP_BASE   = {'Rice':2800,'Coconut':9200,'Arecanut':2100,'Banana':22000,'Black pepper':350, 'Cocoa':600, 'Cashewnut':500, 'Mango':5000}
-CROP_UNITS  = {'Rice':'kg/ha','Coconut':'nuts/ha','Arecanut':'kg/ha','Banana':'kg/ha','Black pepper':'kg/ha','Cocoa':'kg/ha','Cashewnut':'kg/ha','Mango':'kg/ha'}
+CROP_BASE   = {'Rice':2.4,'Coconut':10.0,'Arecanut':7.2,'Banana':9.1,'Black pepper':2.6, 'Cocoa':0.6, 'Cashewnut':0.5, 'Mango':4.2}
+CROP_UNITS  = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha','Banana':'tonnes/ha','Black pepper':'tonnes/ha','Cocoa':'tonnes/ha','Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
 
 
 def build_features(crop_enc, weather, soil, area):
@@ -71,8 +96,15 @@ def predict(crop, model_name, weather, soil, area):
             le = joblib.load(le_path)
             model = joblib.load(model_path)
             
+            scaler_path = os.path.join(base_path, 'scaler.joblib')
+            scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+            
             crop_enc = le.transform([crop])[0]
             features = build_features(crop_enc, weather, soil, area)
+            
+            if scaler:
+                features = scaler.transform(features)
+                
             pred_val = float(np.clip(model.predict(features)[0], 0, None))
             
             return max(50.0, float(pred_val)), 'model'
@@ -132,11 +164,12 @@ def main():
 
         # All-model comparison
         print("\n  -- All Models Comparison ---------------")
-        noise = {'LSTM':0.97,'BiLSTM':1.01,'GRU':0.99,'CNN-LSTM':1.03,'Transformer':0.98}
+        noise = {'LSTM': 0.97, 'BiLSTM': 1.01, 'GRU': 0.99, 'CNN-LSTM': 1.03, 'Transformer': 0.98, 'TCN': 0.96}
         for m in MODEL_NAMES:
-            y   = max(50, pred_yield * noise[m] + np.random.normal(0, pred_yield*0.02))
+            y = max(50, pred_yield * noise.get(m, 1.0) + np.random.normal(0, pred_yield*0.02))
             tag = " ← selected" if m == model_name else ""
-            bar = "#" * int(y / (max(CROP_BASE.values())/30))
+            bar_len = int(y / (max(CROP_BASE.values())/30))
+            bar = "#" * max(1, bar_len)
             print(f"  {m:<14} {y:>8,.0f} {CROP_UNITS[crop]}  {bar}{tag}")
 
         again = input("\n  Predict again? (y/n): ").strip().lower()

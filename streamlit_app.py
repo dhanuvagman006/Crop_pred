@@ -12,7 +12,31 @@ import matplotlib
 matplotlib.use('Agg')
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.base import BaseEstimator, RegressorMixin
 import tensorflow as tf
+
+# Must define the same wrapper class for joblib to load it
+class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=20):
+        self.model_type = model_type
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.n_features = n_features
+        self.model = None
+        self.history_ = None
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if 'model_bytes' in state:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
+                tmp.write(self.model_bytes)
+                tmp.flush()
+                self.model = tf.keras.models.load_model(tmp.name)
+            os.unlink(tmp.name)
+            del self.model_bytes
+    def predict(self, X):
+        X_res = np.array(X).reshape((-1, 1, self.n_features))
+        return self.model.predict(X_res, verbose=0).flatten()
 
 # ── Page Config ───────────────────────────────────────────
 st.set_page_config(
@@ -129,9 +153,9 @@ st.markdown("""
 # ── Constants ──────────────────────────────────────────────
 CROPS        = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
 MODEL_NAMES  = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
-CROP_UNITS   = {'Rice':'kg/ha','Coconut':'nuts/ha','Arecanut':'kg/ha',
-                'Banana':'kg/ha','Black pepper':'kg/ha','Cocoa':'kg/ha',
-                'Cashewnut':'kg/ha','Mango':'kg/ha'}
+CROP_UNITS   = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha',
+                'Banana':'tonnes/ha','Black pepper':'tonnes/ha','Cocoa':'tonnes/ha',
+                'Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
 MODEL_COLORS = {'LSTM':'#2196F3','BiLSTM':'#4CAF50','GRU':'#FF9800',
                 'CNN-LSTM':'#9C27B0','Transformer':'#F44336','TCN':'#00BCD4'}
 
@@ -252,15 +276,23 @@ with tab1:
                     le = joblib.load(le_path)
                     model = joblib.load(model_path)
                     
+                    scaler_path = os.path.join(base_path, 'scaler.joblib')
+                    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+                    
                     crop_enc = le.transform([selected_crop])[0]
                     input_feat = build_features(crop_enc, weather_vals, soil_vals, area_val)
+                    
+                    if scaler:
+                        input_feat = scaler.transform(input_feat)
+                        
                     pred_yield = float(np.clip(model.predict(input_feat)[0], 0, None))
                     pred_mode = 'model'
                 except Exception as e:
                     st.warning(f"Model inference failed: {e}. Falling back to heuristic.")
             
             # Base factors for sensitivity calculations
-            crop_base = {'Rice': 2800, 'Coconut': 9200, 'Arecanut': 2100, 'Banana': 22000, 'Black pepper': 350, 'Cocoa': 600, 'Cashewnut': 500, 'Mango': 5000}
+            # Base factors for sensitivity calculations (tonnes/ha)
+            crop_base = {'Rice': 2.4, 'Coconut': 10.0, 'Arecanut': 7.2, 'Banana': 9.1, 'Black pepper': 2.6, 'Cocoa': 0.6, 'Cashewnut': 0.5, 'Mango': 4.2}
             base = crop_base[selected_crop]
             
             rain_eff  = (weather_vals['Annual_Rainfall_mm'] - 3500) / 3500 * 0.15
