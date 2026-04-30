@@ -20,6 +20,7 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
+import argparse
 from tensorflow.keras.models import Model, Sequential
 from tensorflow.keras.layers import (
     LSTM, GRU, Bidirectional, Dense, Dropout, Conv1D,
@@ -32,6 +33,15 @@ from tensorflow.keras.optimizers import Adam
 
 tf.random.set_seed(42)
 np.random.seed(42)
+
+# CLI for quick runs and reproducibility
+parser = argparse.ArgumentParser(description='Train crop yield models')
+parser.add_argument('--quick', action='store_true', help='Run a quick dry-run (fewer epochs, smaller data)')
+parser.add_argument('--seed', type=int, default=42, help='Random seed')
+args = parser.parse_args()
+
+tf.random.set_seed(args.seed)
+np.random.seed(args.seed)
 
 # ──────────────────────────────────────────────
 # 1. CONFIGURATION
@@ -48,6 +58,11 @@ CFG = {
     'output_dir'  : 'outputs',
     'model_dir'   : 'outputs/models',
 }
+
+if args.quick:
+    CFG['epochs'] = 3
+    CFG['batch_size'] = 8
+    CFG['patience'] = 5
 
 os.makedirs(CFG['output_dir'], exist_ok=True)
 os.makedirs(CFG['model_dir'],  exist_ok=True)
@@ -95,6 +110,11 @@ le = LabelEncoder()
 df['Crop_encoded'] = le.fit_transform(df['Crop'])
 df = df.sort_values(['Crop', 'Year']).reset_index(drop=True)
 
+# Exclude synthesized/expanded rows if present to avoid biased evaluation
+for flag_col in ['Is_Synthesized', 'Is_Expanded']:
+    if flag_col in df.columns:
+        df = df[~df[flag_col].astype(bool)].reset_index(drop=True)
+
 joblib.dump(le, os.path.join(CFG['output_dir'], 'preprocessors', 'label_encoder.joblib'))
 
 def build_sequences(data_X, data_y, seq_len):
@@ -106,30 +126,66 @@ def build_sequences(data_X, data_y, seq_len):
 
 def prepare_data(crop_name):
     cdf = df[df['Crop'] == crop_name].copy()
+    if len(cdf) <= CFG['seq_len'] + 1:
+        return np.empty((0, CFG['seq_len'], len(FEATURE_COLS))), np.empty((0,)), np.empty((0, CFG['seq_len'], len(FEATURE_COLS))), np.empty((0,)), np.empty((0, CFG['seq_len'], len(FEATURE_COLS))), np.empty((0,)), None, None
+
+    # Use raw features and years to build sequences first (no leakage)
     X_raw = cdf[FEATURE_COLS].values.astype(float)
     y_raw = cdf[TARGET_COL].values.astype(float).reshape(-1, 1)
 
+    # Build raw sequences (unscaled)
+    X_seq_raw, y_seq_raw = build_sequences(X_raw, y_raw, CFG['seq_len'])
+
+    # Year corresponding to each target in the sequence (y index is offset by seq_len)
+    y_years = cdf['Year'].values[CFG['seq_len']:]
+
+    # Determine year-based splits to avoid temporal leakage
+    unique_years = sorted(np.unique(y_years))
+    n_test_years = max(1, int(len(unique_years) * CFG['test_size'] + 0.5))
+    n_val_years = max(1, int(len(unique_years) * CFG['val_size'] + 0.5))
+
+    test_years = unique_years[-n_test_years:]
+    val_years = unique_years[-(n_test_years + n_val_years):-n_test_years] if len(unique_years) > n_test_years else []
+
+    test_mask = np.isin(y_years, test_years)
+    val_mask = np.isin(y_years, val_years) if len(val_years) > 0 else np.zeros_like(test_mask, dtype=bool)
+    train_mask = ~(test_mask | val_mask)
+
+    X_train_raw = X_seq_raw[train_mask]
+    y_train_raw = y_seq_raw[train_mask].reshape(-1, 1)
+    X_val_raw = X_seq_raw[val_mask]
+    y_val_raw = y_seq_raw[val_mask].reshape(-1, 1)
+    X_test_raw = X_seq_raw[test_mask]
+    y_test_raw = y_seq_raw[test_mask].reshape(-1, 1)
+
+    # Fit scalers on training data only (avoid leakage)
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
-    X_scaled = scaler_X.fit_transform(X_raw)
-    y_scaled = scaler_y.fit_transform(y_raw).flatten()
 
-    X_seq, y_seq = build_sequences(X_scaled, y_scaled, CFG['seq_len'])
+    # Fit scaler_X over all time-steps of training sequences
+    n_feat = X_train_raw.shape[2]
+    scaler_X.fit(X_train_raw.reshape(-1, n_feat))
+    scaler_y.fit(y_train_raw)
 
-    split_test = int(len(X_seq) * (1 - CFG['test_size']))
-    split_val  = int(split_test * (1 - CFG['val_size']))
+    # Transform datasets
+    def transform_X(Xr):
+        if Xr.size == 0:
+            return np.empty((0, CFG['seq_len'], n_feat))
+        return scaler_X.transform(Xr.reshape(-1, n_feat)).reshape(-1, CFG['seq_len'], n_feat)
 
-    # SHUFFLE training and validation for better generalization
-    # but keep test set as the 'future' part if possible (or just shuffle all)
-    # Given synthetic data expansion, random shuffle is better for learning the distribution
-    indices = np.arange(len(X_seq))
-    np.random.shuffle(indices)
-    
-    X_seq, y_seq = X_seq[indices], y_seq[indices]
+    X_train = transform_X(X_train_raw)
+    X_val = transform_X(X_val_raw)
+    X_test = transform_X(X_test_raw)
 
-    X_train, y_train = X_seq[:split_val],     y_seq[:split_val]
-    X_val,   y_val   = X_seq[split_val:split_test], y_seq[split_val:split_test]
-    X_test,  y_test  = X_seq[split_test:],    y_seq[split_test:]
+    y_train = scaler_y.transform(y_train_raw).flatten() if y_train_raw.size else np.empty((0,))
+    y_val = scaler_y.transform(y_val_raw).flatten() if y_val_raw.size else np.empty((0,))
+    y_test = scaler_y.transform(y_test_raw).flatten() if y_test_raw.size else np.empty((0,))
+
+    # Shuffle training data only
+    if len(X_train) > 0:
+        idx = np.arange(len(X_train))
+        np.random.shuffle(idx)
+        X_train, y_train = X_train[idx], y_train[idx]
 
     return X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y
 
@@ -232,7 +288,11 @@ for model_name in MODEL_NAMES:
 
 for crop in CROPS:
     print(f"\n  Crop: {crop}")
-    X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y = prepare_data(crop); n_feat = X_train.shape[2]
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y = prepare_data(crop)
+    if scaler_X is None or scaler_y is None or X_train.size == 0 or X_test.size == 0:
+        print(f"    Skipping {crop}: insufficient data after filtering/splitting")
+        continue
+    n_feat = X_train.shape[2]
 
     # Save Scalers for this crop
     joblib.dump(scaler_X, os.path.join(CFG['output_dir'], 'preprocessors', f'scaler_X_{crop.replace(" ","_")}.joblib'))
