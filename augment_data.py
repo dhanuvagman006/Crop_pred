@@ -1,5 +1,12 @@
+import argparse
 import pandas as pd
 import numpy as np
+
+# CLI: allow disabling synthesis/expansion for reproducible "real-only" datasets
+parser = argparse.ArgumentParser(description='Augment DK real crop yield data')
+parser.add_argument('--no-synth', action='store_true', help='Do not synthesize missing crop records')
+parser.add_argument('--no-expand', action='store_true', help='Do not perform massive synthetic expansion')
+args = parser.parse_args()
 
 # Load the real APY data
 df = pd.read_csv('DK_Real_CropYield.csv')
@@ -11,44 +18,49 @@ df['Season'] = df['Season'].str.strip()
 # Handle Rice/Paddy duplication (they are the same in APY context)
 df['Crop'] = df['Crop'].replace('Paddy', 'Rice')
 
-# 1. DUMB REMOVE DUPLICATE DATA (as requested)
+# 1. Remove obvious duplicates
 df = df.drop_duplicates()
 
 # 2. ENSURE 8 CROPS (Synthesize if missing or sparse)
 TARGET_CROPS = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
 years = sorted(df['Crop_Year'].unique())
 
-for crop in TARGET_CROPS:
-    current_count = len(df[df['Crop'] == crop])
-    if current_count < 15: # If sparse or missing
-        print(f"Synthesizing research data for {crop}...")
-        new_rows = []
-        # Base yields for DK region
-        base_yields = {'Cocoa': 600, 'Cashewnut': 500, 'Mango': 5000}
-        base_y = base_yields.get(crop, 1000)
-        
-        for year in years:
-            area = 1500 + np.random.normal(0, 200)
-            # Heuristic yield with some noise
-            yield_val = base_y + np.random.normal(0, base_y * 0.1)
-            prod = (yield_val * area) / 1000
-            
-            new_rows.append({
-                'State_Name': 'Karnataka',
-                'District_Name': 'DAKSHIN KANNAD',
-                'Crop_Year': year,
-                'Season': 'Whole Year',
-                'Crop': crop,
-                'Area': area,
-                'Production': prod,
-                'Yield': yield_val
-            })
-        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+if not args.no_synth:
+    for crop in TARGET_CROPS:
+        current_count = len(df[df['Crop'] == crop])
+        if current_count < 15:  # If sparse or missing
+            print(f"Synthesizing research data for {crop}...")
+            new_rows = []
+            # Base yields for DK region
+            base_yields = {'Cocoa': 600, 'Cashewnut': 500, 'Mango': 5000}
+            base_y = base_yields.get(crop, 1000)
+
+            for year in years:
+                area = 1500 + np.random.normal(0, 200)
+                # Heuristic yield with some noise
+                yield_val = base_y + np.random.normal(0, base_y * 0.1)
+                prod = (yield_val * area) / 1000
+
+                new_rows.append({
+                    'State_Name': 'Karnataka',
+                    'District_Name': 'DAKSHIN KANNAD',
+                    'Crop_Year': year,
+                    'Season': 'Whole Year',
+                    'Crop': crop,
+                    'Area': area,
+                    'Production': prod,
+                    'Yield': yield_val,
+                    'Is_Synthesized': True
+                })
+            df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+else:
+    # mark existing rows as real
+    df['Is_Synthesized'] = False
 
 # 3. AUGMENT WITH SEMI-REAL WEATHER (Dakshina Kannada specific)
 def get_weather(year):
-    np.random.seed(year)
-    rainfall = 3500 + (year % 10) * 50 + np.random.normal(0, 200)
+    np.random.seed(int(year) % 2**32)
+    rainfall = 3500 + (int(year) % 10) * 50 + np.random.normal(0, 200)
     max_temp = 32 + np.random.normal(0, 1)
     min_temp = 22 + np.random.normal(0, 1)
     humidity = 80 + np.random.normal(0, 5)
@@ -57,7 +69,7 @@ def get_weather(year):
     return rainfall, max_temp, min_temp, humidity, sunshine, wind
 
 def get_soil(crop):
-    np.random.seed(hash(crop) % 1000)
+    np.random.seed(abs(hash(crop)) % 2**32)
     ph = 5.5 + np.random.normal(0, 0.3)
     nitrogen = 180 + np.random.normal(0, 20)
     phosphorus = 40 + np.random.normal(0, 5)
@@ -97,46 +109,49 @@ print(f"Original data size: {len(df)}")
 EXPANDED_SAMPLES_PER_CROP = 2000
 expanded_df = []
 
-for crop in TARGET_CROPS:
-    crop_df = df[df['Crop'] == crop].copy()
-    if len(crop_df) == 0: continue
-    
-    # Keep original
-    expanded_df.append(crop_df)
-    
-    # Generate variations
-    num_to_gen = EXPANDED_SAMPLES_PER_CROP - len(crop_df)
-    if num_to_gen > 0:
-        for _ in range(num_to_gen):
-            # Pick a random base row
-            base_row = crop_df.sample(1).iloc[0].copy()
-            
-            # Add a slight yearly trend (0.5% growth per year relative to mean year)
-            mean_year = crop_df['Crop_Year'].mean()
-            year_diff = base_row['Crop_Year'] - mean_year
-            trend_factor = 1.0 + (year_diff * 0.005)
-            
-            # Add jitter to numerical features (1% to 5% noise)
-            num_cols = [
-                'Area', 'Rainfall', 'Max Temp', 'Min Temp', 
-                'Humidity', 'Sunshine', 'Wind Speed', 'Soil pH', 'Nitrogen', 
-                'Phosphorus', 'Potassium', 'Organic Carbon', 'Soil Moisture', 'EC'
-            ]
-            
-            for col in num_cols:
-                noise_lvl = 0.05 if col in ['Rainfall', 'Area'] else 0.02
-                noise = np.random.normal(0, base_row[col] * noise_lvl)
-                base_row[col] = max(0, base_row[col] + noise)
-            
-            # Heuristic Yield variation with trend
-            # base_row['Yield'] is the target. We want it to be somewhat predictable from features.
-            # Let's add a 5% noise to yield too, but keep the trend.
-            base_row['Yield'] = base_row['Yield'] * trend_factor * (1 + np.random.normal(0, 0.03))
-            base_row['Production'] = (base_row['Yield'] * base_row['Area']) / 1000
-            
-            expanded_df.append(pd.DataFrame([base_row]))
+if not args.no_expand:
+    for crop in TARGET_CROPS:
+        crop_df = df[df['Crop'] == crop].copy()
+        if len(crop_df) == 0:
+            continue
 
-df = pd.concat(expanded_df, ignore_index=True)
+        # Keep original
+        expanded_df.append(crop_df)
+
+        # Generate variations
+        num_to_gen = EXPANDED_SAMPLES_PER_CROP - len(crop_df)
+        if num_to_gen > 0:
+            for _ in range(num_to_gen):
+                # Pick a random base row
+                base_row = crop_df.sample(1).iloc[0].copy()
+
+                # Add a slight yearly trend (0.5% growth per year relative to mean year)
+                mean_year = crop_df['Crop_Year'].mean()
+                year_diff = base_row['Crop_Year'] - mean_year
+                trend_factor = 1.0 + (year_diff * 0.005)
+
+                # Add jitter to numerical features (1% to 5% noise)
+                num_cols = [
+                    'Area', 'Rainfall', 'Max Temp', 'Min Temp', 
+                    'Humidity', 'Sunshine', 'Wind Speed', 'Soil pH', 'Nitrogen', 
+                    'Phosphorus', 'Potassium', 'Organic Carbon', 'Soil Moisture', 'EC'
+                ]
+
+                for col in num_cols:
+                    noise_lvl = 0.05 if col in ['Rainfall', 'Area'] else 0.02
+                    noise = np.random.normal(0, abs(base_row[col]) * noise_lvl)
+                    base_row[col] = max(0, base_row[col] + noise)
+
+                # Heuristic Yield variation with trend
+                base_row['Yield'] = base_row['Yield'] * trend_factor * (1 + np.random.normal(0, 0.03))
+                base_row['Production'] = (base_row['Yield'] * base_row['Area']) / 1000
+                base_row['Is_Expanded'] = True
+
+                expanded_df.append(pd.DataFrame([base_row]))
+
+    df = pd.concat(expanded_df, ignore_index=True)
+else:
+    df['Is_Expanded'] = False
 
 # Sort by Crop and Year to maintain temporal structure for sequence building
 df = df.sort_values(['Crop', 'Crop_Year']).reset_index(drop=True)
