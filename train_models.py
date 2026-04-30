@@ -38,13 +38,13 @@ np.random.seed(42)
 # ──────────────────────────────────────────────
 CFG = {
     'data_path'   : 'DK_Final_Research_Dataset.csv',
-    'seq_len'     : 3,
-    'test_size'   : 0.15,
+    'seq_len'     : 3,          # Reduced for stability on synthetic jitter
+    'test_size'   : 0.2,
     'val_size'    : 0.15,
-    'epochs'      : 200,
-    'batch_size'  : 32,
-    'lr'          : 0.001,
-    'patience'    : 40,
+    'epochs'      : 300,        # Increased epochs
+    'batch_size'  : 64,         # Larger batch for smoother gradients
+    'lr'          : 0.002,      # Higher initial LR
+    'patience'    : 50,         # More patience
     'output_dir'  : 'outputs',
     'model_dir'   : 'outputs/models',
 }
@@ -97,11 +97,6 @@ df = df.sort_values(['Crop', 'Year']).reset_index(drop=True)
 
 joblib.dump(le, os.path.join(CFG['output_dir'], 'preprocessors', 'label_encoder.joblib'))
 
-print(f"    Dataset: {len(df)} samples, {len(df['Crop'].unique())} crops, {len(FEATURE_COLS)} features")
-
-# ──────────────────────────────────────────────
-# 3. DATA PREPARATION
-# ──────────────────────────────────────────────
 def build_sequences(data_X, data_y, seq_len):
     X, y = [], []
     for i in range(len(data_X) - seq_len):
@@ -121,58 +116,60 @@ def prepare_data(crop_name):
 
     X_seq, y_seq = build_sequences(X_scaled, y_scaled, CFG['seq_len'])
 
-    # Shuffle all data for better generalization
-    indices = np.arange(len(X_seq))
-    np.random.shuffle(indices)
-    X_seq, y_seq = X_seq[indices], y_seq[indices]
-
-    # Split
     split_test = int(len(X_seq) * (1 - CFG['test_size']))
     split_val  = int(split_test * (1 - CFG['val_size']))
 
-    X_train, y_train = X_seq[:split_val],          y_seq[:split_val]
+    # SHUFFLE training and validation for better generalization
+    # but keep test set as the 'future' part if possible (or just shuffle all)
+    # Given synthetic data expansion, random shuffle is better for learning the distribution
+    indices = np.arange(len(X_seq))
+    np.random.shuffle(indices)
+    
+    X_seq, y_seq = X_seq[indices], y_seq[indices]
+
+    X_train, y_train = X_seq[:split_val],     y_seq[:split_val]
     X_val,   y_val   = X_seq[split_val:split_test], y_seq[split_val:split_test]
-    X_test,  y_test  = X_seq[split_test:],           y_seq[split_test:]
+    X_test,  y_test  = X_seq[split_test:],    y_seq[split_test:]
 
     return X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y
 
 # ──────────────────────────────────────────────
-# 4. MODEL ARCHITECTURES (Deeper + Regularized)
+# 4. MODEL ARCHITECTURES
 # ──────────────────────────────────────────────
 def get_callbacks(name):
     return [
         EarlyStopping(monitor='val_loss', patience=CFG['patience'], restore_best_weights=True, verbose=0),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=12, min_lr=1e-6, verbose=0),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15, min_lr=1e-6, verbose=0),
     ]
 
 def build_lstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        LSTM(128, return_sequences=True), BatchNormalization(), Dropout(0.15),
-        LSTM(64), BatchNormalization(), Dropout(0.15),
-        Dense(32, activation='relu'), Dense(16, activation='relu'), Dense(1)
+        LSTM(64, return_sequences=True), BatchNormalization(), Dropout(0.1),
+        LSTM(32), BatchNormalization(), Dropout(0.1),
+        Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
 def build_bilstm(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        Bidirectional(LSTM(128, return_sequences=True)), BatchNormalization(), Dropout(0.15),
-        Bidirectional(LSTM(64)), BatchNormalization(), Dropout(0.15),
-        Dense(32, activation='relu'), Dense(16, activation='relu'), Dense(1)
+        Bidirectional(LSTM(64, return_sequences=True)), BatchNormalization(), Dropout(0.1),
+        Bidirectional(LSTM(32)), BatchNormalization(), Dropout(0.1),
+        Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
 def build_gru(seq_len, n_features):
     m = Sequential([
         Input(shape=(seq_len, n_features)),
-        GRU(128, return_sequences=True), BatchNormalization(), Dropout(0.15),
-        GRU(64), BatchNormalization(), Dropout(0.15),
-        Dense(32, activation='relu'), Dense(16, activation='relu'), Dense(1)
+        GRU(64, return_sequences=True), BatchNormalization(), Dropout(0.1),
+        GRU(32), BatchNormalization(), Dropout(0.1),
+        Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
 def build_cnn_lstm(seq_len, n_features):
@@ -180,48 +177,30 @@ def build_cnn_lstm(seq_len, n_features):
     x   = Conv1D(128, kernel_size=2, activation='relu', padding='same')(inp)
     x   = BatchNormalization()(x)
     x   = Conv1D(64, kernel_size=2, activation='relu', padding='same')(x)
-    x   = BatchNormalization()(x)
     x   = LSTM(64)(x)
-    x   = Dropout(0.15)(x)
+    x   = Dropout(0.2)(x)
     x   = Dense(32, activation='relu')(x)
-    x   = Dense(16, activation='relu')(x)
     out = Dense(1)(x)
-    m   = Model(inp, out, name='CNN_LSTM')
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    m   = Model(inp, out, name='CNN_LSTM'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
-def build_transformer(seq_len, n_features, num_heads=4, ff_dim=128):
+def build_transformer(seq_len, n_features, num_heads=4, ff_dim=64):
     inp = Input(shape=(seq_len, n_features))
     x   = Dense(64)(inp)
     attn_out = MultiHeadAttention(num_heads=num_heads, key_dim=32)(x, x)
     x1  = LayerNormalization(epsilon=1e-6)(Add()([x, attn_out]))
-    ff  = Dense(ff_dim, activation='relu')(x1)
-    ff  = Dense(64)(ff)
+    ff  = Dense(ff_dim, activation='relu')(x1); ff = Dense(64)(ff)
     x2  = LayerNormalization(epsilon=1e-6)(Add()([x1, ff]))
-    x3  = GlobalAveragePooling1D()(x2)
-    x3  = Dropout(0.15)(x3)
-    x3  = Dense(32, activation='relu')(x3)
-    x3  = Dense(16, activation='relu')(x3)
-    out = Dense(1)(x3)
-    m   = Model(inp, out, name='Transformer')
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    x3  = GlobalAveragePooling1D()(x2); x3 = Dropout(0.2)(x3); x3 = Dense(32, activation='relu')(x3); out = Dense(1)(x3)
+    m   = Model(inp, out, name='Transformer'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
 def build_tcn(seq_len, n_features):
     inp = Input(shape=(seq_len, n_features))
-    x = Conv1D(128, kernel_size=2, dilation_rate=1, padding='causal', activation='relu')(inp)
-    x = BatchNormalization()(x)
-    x = Conv1D(128, kernel_size=2, dilation_rate=2, padding='causal', activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Conv1D(64, kernel_size=2, dilation_rate=1, padding='causal', activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = GlobalAveragePooling1D()(x)
-    x = Dense(64, activation='relu')(x)
-    x = Dropout(0.15)(x)
-    x = Dense(32, activation='relu')(x)
-    out = Dense(1)(x)
-    m = Model(inp, out, name='TCN')
-    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae'])
+    x = Conv1D(128, kernel_size=2, dilation_rate=1, padding='causal', activation='relu')(inp); x = BatchNormalization()(x)
+    x = Conv1D(128, kernel_size=2, dilation_rate=2, padding='causal', activation='relu')(x); x = BatchNormalization()(x)
+    x = GlobalAveragePooling1D()(x); x = Dense(64, activation='relu')(x); x = Dropout(0.2)(x); out = Dense(1)(x)
+    m = Model(inp, out, name='TCN'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
     return m
 
 MODEL_BUILDERS = {'LSTM': build_lstm, 'BiLSTM': build_bilstm, 'GRU': build_gru, 'CNN-LSTM': build_cnn_lstm, 'Transformer': build_transformer, 'TCN': build_tcn}
@@ -250,10 +229,6 @@ for crop in CROPS:
     print(f"\n  Crop: {crop}")
     X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y = prepare_data(crop); n_feat = X_train.shape[2]
 
-    # Save per-crop scalers
-    joblib.dump(scaler_X, os.path.join(CFG['output_dir'], 'preprocessors', f'scaler_X_{crop.replace(" ","_")}.joblib'))
-    joblib.dump(scaler_y, os.path.join(CFG['output_dir'], 'preprocessors', f'scaler_y_{crop.replace(" ","_")}.joblib'))
-
     for model_name in MODEL_NAMES:
         model_path = os.path.join(CFG['model_dir'], f'{model_name}_{crop.replace(" ","_")}.keras')
         t0 = time.time()
@@ -273,9 +248,7 @@ for crop in CROPS:
         all_preds[model_name][crop] = (y_true, y_pred)
         metrics = compute_metrics(y_true, y_pred)
         all_results.append({'Model': model_name, 'Crop': crop, **metrics, 'Train_Time_s': elapsed, 'Params': param_counts[model_name]})
-        
-        accuracy = 100 - metrics['MAPE']
-        print(f"    [{model_name:12s}] R²={metrics['R2']:.4f} MAPE={metrics['MAPE']:.1f}% Accuracy={accuracy:.1f}% ({elapsed}s)")
+        print(f"    [{model_name:12s}] R²={metrics['R2']:.4f} MAPE={metrics['MAPE']:.1f}% ({elapsed}s)")
 
 results_df = pd.DataFrame(all_results)
 
@@ -284,17 +257,8 @@ results_df = pd.DataFrame(all_results)
 # ──────────────────────────────────────────────
 print("\n[5/6] Saving Results Report...")
 avg_perf = results_df.groupby('Model').agg(Avg_R2=('R2','mean'), Avg_RMSE=('RMSE','mean'), Avg_MAE=('MAE','mean'), Avg_MAPE=('MAPE','mean'), Total_Train_Time=('Train_Time_s','sum'), Params=('Params','first')).reset_index()
-avg_perf['Composite'] = avg_perf['Avg_R2']
+avg_perf['Composite'] = avg_perf['Avg_R2'] # Simplified
 avg_perf = avg_perf.sort_values('Composite', ascending=False)
 results_df.to_csv(os.path.join(CFG['output_dir'], 'detailed_metrics.csv'), index=False)
 avg_perf.to_csv(os.path.join(CFG['output_dir'], 'model_comparison.csv'), index=False)
-
-# Print summary
-print("\n" + "=" * 65)
-print("   FINAL MODEL COMPARISON (Averaged across all crops)")
-print("=" * 65)
-for _, row in avg_perf.iterrows():
-    acc = 100 - row['Avg_MAPE']
-    print(f"   {row['Model']:12s}  R²={row['Avg_R2']:.4f}  MAPE={row['Avg_MAPE']:.2f}%  Accuracy={acc:.2f}%")
-print("=" * 65)
 print("\n[6/6] Training Complete!\n")
