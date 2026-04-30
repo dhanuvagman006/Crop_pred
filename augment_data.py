@@ -94,7 +94,7 @@ df = df.drop_duplicates(subset=['Crop', 'Crop_Year', 'Season'])
 
 # 4. MASSIVE SYNTHETIC EXPANSION (To help Deep Learning models generalize)
 print(f"Original data size: {len(df)}")
-EXPANDED_SAMPLES_PER_CROP = 1000
+EXPANDED_SAMPLES_PER_CROP = 2000
 expanded_df = []
 
 for crop in TARGET_CROPS:

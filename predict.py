@@ -73,8 +73,8 @@ def predict(crop, model_name, weather, soil, area):
             ]])
             
             X_sc = sc_x.transform(features)
-            # Reshape for sequence length (3)
-            X_seq = np.repeat(X_sc[:, np.newaxis, :], 3, axis=1)
+            # Reshape for sequence length (5)
+            X_seq = np.repeat(X_sc[:, np.newaxis, :], 5, axis=1)
             
             raw_pred_s = model.predict(X_seq, verbose=0).flatten()
             pred_val = sc_y.inverse_transform(raw_pred_s.reshape(-1, 1)).flatten()[0]
