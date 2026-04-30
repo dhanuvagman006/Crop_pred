@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
 
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
@@ -38,13 +38,13 @@ np.random.seed(42)
 # ──────────────────────────────────────────────
 CFG = {
     'data_path'   : 'DK_Final_Research_Dataset.csv',
-    'seq_len'     : 3,          # Reduced for stability on synthetic jitter
-    'test_size'   : 0.2,
+    'seq_len'     : 4,          # Increased for more temporal context
+    'test_size'   : 0.15,       # More data for training
     'val_size'    : 0.15,
-    'epochs'      : 300,        # Increased epochs
-    'batch_size'  : 64,         # Larger batch for smoother gradients
-    'lr'          : 0.002,      # Higher initial LR
-    'patience'    : 50,         # More patience
+    'epochs'      : 400,        # Increased epochs
+    'batch_size'  : 32,         # Smaller batch for smoother gradients
+    'lr'          : 0.001,      # Adjusted LR
+    'patience'    : 80,         # More patience
     'output_dir'  : 'outputs',
     'model_dir'   : 'outputs/models',
 }
@@ -109,7 +109,7 @@ def prepare_data(crop_name):
     X_raw = cdf[FEATURE_COLS].values.astype(float)
     y_raw = cdf[TARGET_COL].values.astype(float).reshape(-1, 1)
 
-    scaler_X = MinMaxScaler()
+    scaler_X = StandardScaler()
     scaler_y = MinMaxScaler()
     X_scaled = scaler_X.fit_transform(X_raw)
     y_scaled = scaler_y.fit_transform(y_raw).flatten()
@@ -149,7 +149,7 @@ def build_lstm(seq_len, n_features):
         LSTM(32), BatchNormalization(), Dropout(0.1),
         Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 def build_bilstm(seq_len, n_features):
@@ -159,7 +159,7 @@ def build_bilstm(seq_len, n_features):
         Bidirectional(LSTM(32)), BatchNormalization(), Dropout(0.1),
         Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 def build_gru(seq_len, n_features):
@@ -169,7 +169,7 @@ def build_gru(seq_len, n_features):
         GRU(32), BatchNormalization(), Dropout(0.1),
         Dense(16, activation='relu'), Dense(1)
     ])
-    m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 def build_cnn_lstm(seq_len, n_features):
@@ -181,7 +181,7 @@ def build_cnn_lstm(seq_len, n_features):
     x   = Dropout(0.2)(x)
     x   = Dense(32, activation='relu')(x)
     out = Dense(1)(x)
-    m   = Model(inp, out, name='CNN_LSTM'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m   = Model(inp, out, name='CNN_LSTM'); m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 def build_transformer(seq_len, n_features, num_heads=4, ff_dim=64):
@@ -192,7 +192,7 @@ def build_transformer(seq_len, n_features, num_heads=4, ff_dim=64):
     ff  = Dense(ff_dim, activation='relu')(x1); ff = Dense(64)(ff)
     x2  = LayerNormalization(epsilon=1e-6)(Add()([x1, ff]))
     x3  = GlobalAveragePooling1D()(x2); x3 = Dropout(0.2)(x3); x3 = Dense(32, activation='relu')(x3); out = Dense(1)(x3)
-    m   = Model(inp, out, name='Transformer'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m   = Model(inp, out, name='Transformer'); m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 def build_tcn(seq_len, n_features):
@@ -200,7 +200,7 @@ def build_tcn(seq_len, n_features):
     x = Conv1D(128, kernel_size=2, dilation_rate=1, padding='causal', activation='relu')(inp); x = BatchNormalization()(x)
     x = Conv1D(128, kernel_size=2, dilation_rate=2, padding='causal', activation='relu')(x); x = BatchNormalization()(x)
     x = GlobalAveragePooling1D()(x); x = Dense(64, activation='relu')(x); x = Dropout(0.2)(x); out = Dense(1)(x)
-    m = Model(inp, out, name='TCN'); m.compile(optimizer=Adam(CFG['lr']), loss='mse', metrics=['mae'])
+    m = Model(inp, out, name='TCN'); m.compile(optimizer=Adam(CFG['lr']), loss='huber', metrics=['mae', 'mape'])
     return m
 
 MODEL_BUILDERS = {'LSTM': build_lstm, 'BiLSTM': build_bilstm, 'GRU': build_gru, 'CNN-LSTM': build_cnn_lstm, 'Transformer': build_transformer, 'TCN': build_tcn}

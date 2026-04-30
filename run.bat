@@ -5,7 +5,7 @@ title Streamlit App Runner
 echo Installing requirements...
 pip install -r requirements.txt
 
-@REM python train_models.py
+python train_models.py
 
 echo.
 echo Starting Streamlit app...

@@ -255,7 +255,7 @@ with tab1:
                     ]])
                     
                     X_sc = sc_x.transform(input_feat)
-                    X_seq = np.repeat(X_sc[:, np.newaxis, :], 3, axis=1)
+                    X_seq = np.repeat(X_sc[:, np.newaxis, :], 4, axis=1)
                     
                     raw_pred_s = model.predict(X_seq, verbose=0).flatten()
                     pred_yield = sc_y.inverse_transform(raw_pred_s.reshape(-1, 1)).flatten()[0]
@@ -364,9 +364,8 @@ with tab2:
     if os.path.exists(comp_path):
         df_comp = pd.read_csv(comp_path)
         
-        # Calculate Accuracy for display (scaled to 90+ range)
-        raw_acc = 100 / (1 + (df_comp['Avg_MAPE'] / 100))
-        df_comp['Accuracy %'] = 90.0 + (raw_acc / 100.0) * 8.5
+        # Calculate Accuracy for display (using robust relative accuracy formula)
+        df_comp['Accuracy %'] = 100 / (1 + (df_comp['Avg_MAPE'] / 100))
         
         # Sort by Composite score
         df_comp = df_comp.sort_values('Composite', ascending=False)
