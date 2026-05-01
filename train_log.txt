@@ -1,0 +1,75 @@
+2026-05-01 13:11:59.787329: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING:tensorflow:From C:\Users\dhanu\AppData\Local\Programs\Python\Python311\Lib\site-packages\keras\src\losses.py:2976: The name tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy instead.
+
+======================================================================
+High-Accuracy Crop Yield Training — 6 DL Models
+======================================================================
+Loaded 75 rows, columns: ['Crop', 'Year', 'Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine', 'Wind Speed', 'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium', 'Organic Carbon', 'Soil Moisture', 'EC', 'Area', 'Yield', 'Production']
+Candidate features: ['Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine', 'Wind Speed', 'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium', 'Organic Carbon', 'Soil Moisture', 'EC', 'Area', 'crop_encoded', 'temp_range', 'heat_stress_index', 'drought_index', 'soil_ph_deviation', 'yield_lag1', 'yield_lag2', 'yield_rolling3']
+Train years: [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019]  Val: [2020, 2021]  Test: [2022, 2023, 2024]
+Selected 22 features: ['Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine', 'Wind Speed', 'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium', 'Organic Carbon', 'Soil Moisture', 'EC', 'Area', 'crop_encoded', 'temp_range', 'heat_stress_index', 'drought_index', 'soil_ph_deviation', 'yield_lag1', 'yield_lag2', 'yield_rolling3']
+Total sequences: (50, 5, 22)  y shape: (50,)
+Train: (30, 5, 22)  Val: (5, 5, 22)  Test: (15, 5, 22)
+After augmentation — Train: (240, 5, 22)
+
+------------------------------------------------------------
+Training LSTM ...
+2026-05-01 13:12:12.243880: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE SSE2 SSE3 SSE4.1 SSE4.2 AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+  Finished in 43.0s  (212 epochs)
+  R²=0.7323  RMSE=12700.54  MAE=7848.59  MAPE=36.91%
+  CV R²: 0.7409 ± 0.1070
+
+------------------------------------------------------------
+Training BiLSTM ...
+  Finished in 91.69s  (300 epochs)
+  R²=0.9415  RMSE=5939.84  MAE=3283.68  MAPE=16.53%
+  CV R²: 0.8819 ± 0.0174
+
+------------------------------------------------------------
+Training GRU ...
+  Finished in 24.46s  (68 epochs)
+  R²=0.4777  RMSE=17741.49  MAE=9627.14  MAPE=30.87%
+  CV R²: 0.6703 ± 0.2143
+
+------------------------------------------------------------
+Training CNN-LSTM ...
+  Finished in 34.27s  (150 epochs)
+  R²=0.9121  RMSE=7278.05  MAE=4709.42  MAPE=23.81%
+  CV R²: 0.8906 ± 0.0524
+
+------------------------------------------------------------
+Training Transformer ...
+  Finished in 17.9s  (50 epochs)
+  R²=0.8610  RMSE=9151.19  MAE=6358.15  MAPE=51.53%
+  CV R²: 0.9809 ± 0.0074
+
+------------------------------------------------------------
+Training Attention-LSTM ...
+  Finished in 31.15s  (161 epochs)
+  R²=0.9185  RMSE=7007.92  MAE=5438.64  MAPE=37.02%
+  CV R²: 0.7345 ± 0.2451
+
+====================================================================
+       FINAL MODEL PERFORMANCE SUMMARY
+====================================================================
+Model                   R2       RMSE      MAPE   CV R2(+/-std)
+--------------------------------------------------------------------
+LSTM                0.7323   12700.54    36.91%   0.741+/-0.107
+BiLSTM              0.9415    5939.84    16.53%   0.882+/-0.017
+GRU                 0.4777   17741.49    30.87%   0.670+/-0.214
+CNN-LSTM            0.9121    7278.05    23.81%   0.891+/-0.052
+Transformer         0.8610    9151.19    51.53%   0.981+/-0.007
+Attention-LSTM      0.9185    7007.92    37.02%   0.735+/-0.245
+Ensemble            0.8883    8203.88    18.68%             ---
+====================================================================
+Best single model : BiLSTM with R2=0.9415
+Ensemble R2       : 0.8883
+All plots saved   : outputs/
+Total training    : 17.5 minutes
+
+[WARN] Models below R2=0.88:
+      Model     R2
+       LSTM 0.7323
+        GRU 0.4777
+Transformer 0.8610

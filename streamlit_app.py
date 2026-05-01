@@ -14,6 +14,7 @@ matplotlib.use('Agg')
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.base import BaseEstimator, RegressorMixin
 import tensorflow as tf
+import subprocess
 
 # Must define the same wrapper class for joblib to load it
 class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
@@ -159,6 +160,30 @@ CROP_UNITS   = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/
 MODEL_COLORS = {'LSTM':'#2196F3','BiLSTM':'#4CAF50','GRU':'#FF9800',
                 'CNN-LSTM':'#9C27B0','Transformer':'#F44336','TCN':'#00BCD4'}
 
+COLUMN_MAP = {
+    'avg_mape':   ['Avg_MAPE','MAPE','Test_MAPE','mape','avg_mape'],
+    'avg_r2':     ['Avg_R2','R2','Test_R2','r2','R_squared'],
+    'avg_rmse':   ['Avg_RMSE','RMSE','Test_RMSE','rmse'],
+    'avg_mae':    ['Avg_MAE','MAE','Test_MAE','mae'],
+    'model_name': ['Model','model','Model_Name','model_name'],
+}
+
+def resolve(df, key):
+    for candidate in COLUMN_MAP[key]:
+        if candidate in df.columns:
+            return candidate
+    raise KeyError(f"Cannot resolve '{key}'. Available: {df.columns.tolist()}")
+
+def safe_col(df, *candidates):
+    for c in candidates:
+        match = next((x for x in df.columns if x.upper()==c.upper()), None)
+        if match:
+            return match
+    raise KeyError(f"None of {candidates} found in columns: {df.columns.tolist()}")
+
+st.session_state.setdefault('selected_model', 'LSTM')
+st.session_state.setdefault('selected_crop', CROPS[0])
+
 
 def build_features(crop_enc, weather_vals, soil_vals, area_val):
     return np.array([[
@@ -266,7 +291,7 @@ with tab1:
             # ── Tabular model inference ────────────────────────
             base_path = os.path.join('outputs', 'preprocessors')
             le_path   = os.path.join(base_path, 'label_encoder.joblib')
-            model_path = os.path.join('outputs', 'models', f"{selected_model}.joblib")
+            model_path = os.path.join('outputs', 'models', f"{selected_model}.keras")
 
             pred_mode = 'formula'
             pred_yield = 0.0
@@ -274,7 +299,7 @@ with tab1:
             if all(os.path.exists(p) for p in [le_path, model_path]):
                 try:
                     le = joblib.load(le_path)
-                    model = joblib.load(model_path)
+                    model = tf.keras.models.load_model(model_path)
                     
                     scaler_path = os.path.join(base_path, 'scaler.joblib')
                     scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
@@ -284,11 +309,15 @@ with tab1:
                     
                     if scaler:
                         input_feat = scaler.transform(input_feat)
-                        
-                    pred_yield = float(np.clip(model.predict(input_feat)[0], 0, None))
+                    
+                    seq_len = 5
+                    input_feat_3d = np.repeat(input_feat.reshape(1, 1, -1), seq_len, axis=1)
+                    
+                    pred_yield = float(np.clip(model.predict(input_feat_3d)[0], 0, None))
                     pred_mode = 'model'
                 except Exception as e:
-                    st.warning(f"Model inference failed: {e}. Falling back to heuristic.")
+                    st.error(f"Could not load {selected_model}: {e}")
+                    # fallback handled below
             
             # Base factors for sensitivity calculations
             # Base factors for sensitivity calculations (tonnes/ha)
@@ -389,61 +418,124 @@ with tab2:
     st.markdown("### 📊 Comprehensive Model Performance Analysis")
     
     comp_path = os.path.join('outputs', 'model_comparison.csv')
-    if os.path.exists(comp_path):
+    try:
         df_comp = pd.read_csv(comp_path)
+        df_comp.columns = (df_comp.columns
+                           .str.strip()
+                           .str.replace(' ', '_')
+                           .str.replace('-', '_'))
+    except FileNotFoundError:
+        st.warning("model_comparison.csv not found. Train models first.")
+        st.stop()
         
-        # Calculate Accuracy for display (using robust relative accuracy formula)
-        df_comp['Accuracy %'] = 100 / (1 + (df_comp['Avg_MAPE'] / 100))
+    # Calculate Accuracy for display (using robust relative accuracy formula)
+    mape_col = next((c for c in df_comp.columns if 'MAPE' in c.upper()), None)
+    if mape_col is None:
+        st.error(f"No MAPE column found. Columns: {df_comp.columns.tolist()}")
+        st.stop()
+    df_comp['Accuracy %'] = 100 / (1 + (df_comp[mape_col] / 100))
+    
+    # Sort by R2 or Accuracy
+    try:
+        sort_col = resolve(df_comp, 'avg_r2')
+        df_comp = df_comp.sort_values(sort_col, ascending=False)
+    except KeyError:
+        df_comp = df_comp.sort_values('Accuracy %', ascending=False)
         
-        # Sort by Composite score
-        df_comp = df_comp.sort_values('Composite', ascending=False)
+    st.markdown("#### Model Rankings & Metrics")
+    
+    # Format for display
+    try:
+        mod_col = resolve(df_comp, 'model_name')
+        r2_col = resolve(df_comp, 'avg_r2')
+        rmse_col = resolve(df_comp, 'avg_rmse')
+        mae_col = resolve(df_comp, 'avg_mae')
+        time_col = safe_col(df_comp, 'Total_Train_Time', 'Time', 'Train_Time', 'Epochs')
         
-        st.markdown("#### Model Rankings & Metrics")
+        display_cols = [mod_col, 'Accuracy %', r2_col, rmse_col, mae_col, time_col]
         
-        # Format for display
-        display_df = df_comp[['Model', 'Accuracy %', 'Avg_R2', 'Avg_RMSE', 'Avg_MAE', 'Total_Train_Time', 'Params']].copy()
-        display_df.columns = ['Model', 'Yield Accuracy (%)', 'R² Score', 'RMSE', 'MAE', 'Train Time (s)', 'Parameters']
+        if 'Params' in df_comp.columns:
+            display_cols.append('Params')
+            
+        display_df = df_comp[display_cols].copy()
+        
+        new_cols = ['Model', 'Yield Accuracy (%)', 'R² Score', 'RMSE', 'MAE', 'Train Time / Epochs']
+        if len(display_cols) > 6: new_cols.append('Parameters')
+        display_df.columns = new_cols
         
         st.dataframe(
             display_df.style
+            .hide(axis="index")
             .background_gradient(subset=['Yield Accuracy (%)'], cmap='Blues')
             .format({
                 'Yield Accuracy (%)': '{:.2f}%',
                 'R² Score': '{:.4f}',
                 'RMSE': '{:.2f}',
                 'MAE': '{:.2f}',
-                'Train Time (s)': '{:.2f}s',
+                'Train Time / Epochs': '{:.2f}',
                 'Parameters': '{:,}'
             }),
-            width='stretch'
+            use_container_width=True
         )
+    except Exception as e:
+        st.error(f"Error formatting display dataframe: {e}")
+        st.dataframe(df_comp)
         
-        # Other Factors
-        st.markdown("#### 🔍 Model Efficiency Factors")
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_time, ax_time = plt.subplots(figsize=(6, 4))
-            ax_time.bar(df_comp['Model'], df_comp['Total_Train_Time'], color=[MODEL_COLORS.get(m, '#3b82f6') for m in df_comp['Model']])
-            ax_time.set_title('Training Computational Cost (s)', color='white', fontweight='bold')
-            ax_time.set_ylabel('Seconds', color='#94a3b8')
-            ax_time.tick_params(colors='#94a3b8')
-            ax_time.set_facecolor('none')
-            fig_time.patch.set_facecolor('none')
-            st.pyplot(fig_time); plt.close()
-            
-        with c2:
+    # Other Factors
+    st.markdown("#### 🔍 Model Efficiency Factors")
+    c1, c2 = st.columns(2)
+    with c1:
+        time_col = safe_col(df_comp, 'Total_Train_Time', 'Time', 'Train_Time', 'Epochs')
+        mod_col = resolve(df_comp, 'model_name')
+        fig_time, ax_time = plt.subplots(figsize=(6, 4))
+        ax_time.bar(df_comp[mod_col], df_comp[time_col], color=[MODEL_COLORS.get(m, '#3b82f6') for m in df_comp[mod_col]])
+        ax_time.set_title('Training Computational Cost', color='white', fontweight='bold')
+        ax_time.set_ylabel('Cost (Time/Epochs)', color='#94a3b8')
+        ax_time.tick_params(axis='x', colors='#94a3b8', rotation=45)
+        ax_time.tick_params(axis='y', colors='#94a3b8')
+        ax_time.set_facecolor('none')
+        fig_time.patch.set_facecolor('none')
+        fig_time.tight_layout()
+        st.pyplot(fig_time); plt.close()
+        
+    with c2:
+        if 'Params' in df_comp.columns:
             fig_param, ax_param = plt.subplots(figsize=(6, 4))
-            ax_param.bar(df_comp['Model'], df_comp['Params']/1000, color=[MODEL_COLORS.get(m, '#3b82f6') for m in df_comp['Model']])
+            ax_param.bar(df_comp[mod_col], df_comp['Params']/1000, color=[MODEL_COLORS.get(m, '#3b82f6') for m in df_comp[mod_col]])
             ax_param.set_title('Model Complexity (K Params)', color='white', fontweight='bold')
             ax_param.set_ylabel('Parameters (Thousands)', color='#94a3b8')
-            ax_param.tick_params(colors='#94a3b8')
+            ax_param.tick_params(axis='x', colors='#94a3b8', rotation=45)
+            ax_param.tick_params(axis='y', colors='#94a3b8')
             ax_param.set_facecolor('none')
             fig_param.patch.set_facecolor('none')
+            fig_param.tight_layout()
             st.pyplot(fig_param); plt.close()
+        else:
+            st.info("Parameter count data not available in CSV.")
 
-        st.success(f"🏆 **Research Recommendation:** The **{df_comp.iloc[0]['Model']}** model is currently the most balanced for the Dakshina Kannada region based on its composite score.")
-    else:
-        st.warning("Model comparison data not found. Please run training first.")
+    st.success(f"🏆 **Research Recommendation:** The **{df_comp.iloc[0][mod_col]}** model is currently the most balanced for the Dakshina Kannada region.")
+
+    st.markdown("---")
+    st.markdown("### 📈 Generated Training Visualizations")
+    img_files = [
+        'model_comparison_bar.png', 'training_curves.png', 'actual_vs_predicted.png',
+        'residuals.png', 'r2_heatmap.png', 'feature_importance.png',
+        'error_distribution.png', 'attention_weights.png'
+    ]
+    
+    for i in range(0, len(img_files), 2):
+        img_cols = st.columns(2)
+        for j, col in enumerate(img_cols):
+            if i + j < len(img_files):
+                img_name = img_files[i+j]
+                img_path = os.path.join('outputs', img_name)
+                with col:
+                    st.markdown(f"**{img_name}**")
+                    if os.path.exists(img_path):
+                        st.image(img_path, use_column_width=True)
+                    else:
+                        st.info("Plot not generated yet. Run training first.")
+
 
     st.markdown("""
     ---
@@ -498,3 +590,14 @@ with tab3:
     st.markdown("**How to use:** Enter weather + soil parameters → Select crop and model → Click Predict")
     st.markdown("**Training:** Run `train_models.py` to retrain all 5 models on your dataset")
     st.markdown("**Best results:** Use real data from IMD, data.gov.in, and ICRISAT for production accuracy")
+
+    st.markdown("---")
+    st.markdown("#### CLI Predict Tester")
+    if st.button("Run predict.py as subprocess"):
+        result = subprocess.run(['python','predict.py'], capture_output=True, text=True, input="1\n1\n\n\n\n\n\n\n\n\n\n\n\n\n\nn\n")
+        if result.returncode != 0:
+            st.error(f"Prediction failed:\n{result.stderr}")
+        else:
+            st.success("Subprocess complete. See output below:")
+            st.code(result.stdout)
+

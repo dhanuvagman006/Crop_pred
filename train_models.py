@@ -1,266 +1,323 @@
-"""Research Grade Training Pipeline with Per-Crop Target Normalization.
-
-This script implements a self-correcting training loop that ensures 
-positive R2 and high accuracy across all crops by normalizing yields 
-per-crop. This is the gold standard for multi-crop agricultural modeling.
 """
-
+High-Accuracy Crop Yield Prediction — 6 DL Models
+Target: R² >= 0.88 on all models
+"""
 from __future__ import annotations
-
-import argparse
-import time
-import warnings
-import os
-import tempfile
-from pathlib import Path
-
-import joblib
+import os, time, warnings, concurrent.futures
 import numpy as np
 import pandas as pd
+import joblib
 import tensorflow as tf
-
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.base import BaseEstimator, RegressorMixin
+from pathlib import Path
+from sklearn.preprocessing import LabelEncoder, RobustScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import (
+    LSTM, GRU, Dense, Dropout, BatchNormalization, Bidirectional,
+    Conv1D, MultiHeadAttention, LayerNormalization,
+    GlobalAveragePooling1D, Multiply, Softmax, Lambda
+)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 
 warnings.filterwarnings('ignore')
+tf.get_logger().setLevel('ERROR')
 
 def set_seeds(seed=42):
     np.random.seed(seed)
     tf.random.set_seed(seed)
-    tf.keras.utils.set_random_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
-parser = argparse.ArgumentParser(description='Train high-accuracy crop-yield models')
-parser.add_argument('--data-path', default='DK_Final_Research_Dataset.csv', help='Training CSV path')
-parser.add_argument('--quick', action='store_true', help='Use fewer epochs')
-parser.add_argument('--seed', type=int, default=42, help='Random seed')
-args = parser.parse_args()
+set_seeds(42)
 
-set_seeds(args.seed)
+# ── Paths ──────────────────────────────────────────────────────────────────
+BASE = Path('outputs')
+MODEL_DIR = BASE / 'models'
+PREPROC_DIR = BASE / 'preprocessors'
+HIST_DIR = BASE / 'histories'
+PRED_DIR = BASE / 'predictions'
+for d in [MODEL_DIR, PREPROC_DIR, HIST_DIR, PRED_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
-CFG = {
-    'output_dir': Path('outputs'),
-    'model_dir': Path('outputs/models'),
-    'preproc_dir': Path('outputs/preprocessors'),
-    'test_year_frac': 0.20,
-    'val_year_frac': 0.15,
-}
+DATA_PATH = 'DK_CropYield_Dataset.csv'
+SEQ_LEN = 5
+MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
 
-MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
+# ── Feature Engineering ────────────────────────────────────────────────────
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    le = LabelEncoder()
+    df['crop_encoded'] = le.fit_transform(df['Crop'])
+    joblib.dump(le, PREPROC_DIR / 'label_encoder.joblib')
 
-BASE_FEATURES = [
-    'Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine', 'Wind Speed',
-    'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium', 'Organic Carbon',
-    'Soil Moisture', 'EC', 'Area', 'Crop_encoded',
+    df['temp_range'] = df['Max Temp'] - df['Min Temp']
+    df['heat_stress_index'] = df['Max Temp'] * df['Humidity'] / 100
+    df['rainfall_intensity'] = df['Rainfall'] / 30
+    df['drought_index'] = 1 - (df['Rainfall'] / df['Rainfall'].max())
+    df['soil_ph_deviation'] = (df['Soil pH'] - 6.5).abs()
+
+    for crop in df['Crop'].unique():
+        mask = df['Crop'] == crop
+        lo, hi = df.loc[mask, 'Yield'].quantile([0.02, 0.98])
+        df.loc[mask, 'Yield'] = df.loc[mask, 'Yield'].clip(lo, hi)
+
+    for col in ['yield_lag1', 'yield_lag2', 'yield_rolling3']:
+        df[col] = np.nan
+
+    for crop in df['Crop'].unique():
+        mask = df['Crop'] == crop
+        grp = df.loc[mask].sort_values('Year')
+        df.loc[grp.index, 'yield_lag1'] = grp['Yield'].shift(1).values
+        df.loc[grp.index, 'yield_lag2'] = grp['Yield'].shift(2).values
+        df.loc[grp.index, 'yield_rolling3'] = grp['Yield'].rolling(3).mean().values
+        gm = grp['Yield'].mean()
+        df.loc[grp.index, 'yield_lag1'] = df.loc[grp.index, 'yield_lag1'].fillna(gm)
+        df.loc[grp.index, 'yield_lag2'] = df.loc[grp.index, 'yield_lag2'].fillna(gm)
+        df.loc[grp.index, 'yield_rolling3'] = df.loc[grp.index, 'yield_rolling3'].fillna(gm)
+
+    for col in ['yield_lag1', 'yield_lag2', 'yield_rolling3']:
+        df[col] = np.log1p(df[col])
+
+    return df
+
+CANDIDATE_FEATURES = [
+    'Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine',
+    'Wind Speed', 'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium',
+    'Organic Carbon', 'Soil Moisture', 'EC', 'Area', 'crop_encoded',
+    'temp_range', 'heat_stress_index', 'drought_index',
+    'soil_ph_deviation', 'yield_lag1', 'yield_lag2', 'yield_rolling3'
 ]
 
-def ensure_dirs():
-    for d in [CFG['output_dir'], CFG['model_dir'], CFG['preproc_dir'], 
-              CFG['output_dir']/'predictions', CFG['output_dir']/'histories']:
-        d.mkdir(parents=True, exist_ok=True)
+def make_sequences(df: pd.DataFrame, feature_cols: list, seq_len: int = SEQ_LEN):
+    X_list, y_list, crops_list, years_list = [], [], [], []
+    for crop in df['Crop'].unique():
+        sub = df[df['Crop'] == crop].sort_values('Year')
+        feats = sub[feature_cols].values
+        targets = sub['Yield'].values
+        yrs = sub['Year'].values
+        for i in range(len(sub) - seq_len):
+            X_list.append(feats[i:i + seq_len])
+            y_list.append(targets[i + seq_len])
+            crops_list.append(crop)
+            years_list.append(yrs[i + seq_len])
+    return (np.array(X_list), np.array(y_list),
+            np.array(crops_list), np.array(years_list))
 
-class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
-    def __init__(self, model_type='LSTM', epochs=100, batch_size=32, n_features=20):
-        self.model_type = model_type
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.n_features = n_features
-        self.model = None
-        self.history_ = None
+# ── Model builders ─────────────────────────────────────────────────────────
+def build_lstm(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = LSTM(32, return_sequences=True)(inp)
+    x = Dropout(0.2)(x)
+    x = LSTM(16)(x)
+    x = Dropout(0.2)(x)
+    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    out = Dense(1)(x)
+    return Model(inp, out, name='LSTM')
 
-    def _build_model(self):
-        inputs = tf.keras.Input(shape=(1, self.n_features))
-        
-        if self.model_type == 'LSTM':
-            x = tf.keras.layers.LSTM(128, return_sequences=True)(inputs)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.LSTM(64)(x)
-        elif self.model_type == 'BiLSTM':
-            x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(128, return_sequences=True))(inputs)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(64))(x)
-        elif self.model_type == 'GRU':
-            x = tf.keras.layers.GRU(128, return_sequences=True)(inputs)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.GRU(64)(x)
-        elif self.model_type == 'CNN-LSTM':
-            x = tf.keras.layers.Conv1D(64, 1, activation='relu')(inputs)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.LSTM(128)(x)
-        elif self.model_type == 'Transformer':
-            attn = tf.keras.layers.MultiHeadAttention(4, self.n_features)(inputs, inputs)
-            x = tf.keras.layers.Add()([inputs, attn])
-            x = tf.keras.layers.LayerNormalization()(x)
-            x = tf.keras.layers.GlobalAveragePooling1D()(x)
-            x = tf.keras.layers.Dense(128, activation='relu')(x)
-        elif self.model_type == 'TCN':
-            # Improved TCN with residual connection and global pooling
-            x = tf.keras.layers.Conv1D(64, 1, padding='causal', dilation_rate=1, activation='relu')(inputs)
-            x = tf.keras.layers.Conv1D(64, 1, padding='causal', dilation_rate=2, activation='relu')(x)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.GlobalAveragePooling1D()(x)
-        else:
-            x = tf.keras.layers.Flatten()(inputs)
-        
-        x = tf.keras.layers.Dense(64, activation='relu')(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
-        outputs = tf.keras.layers.Dense(1)(x)
-        
-        model = tf.keras.Model(inputs, outputs)
-        model.compile(optimizer=tf.keras.optimizers.Adam(0.001), loss='huber')
-        return model
+def build_bilstm(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = Bidirectional(LSTM(32, return_sequences=True))(inp)
+    x = Dropout(0.2)(x)
+    x = Bidirectional(LSTM(16))(x)
+    x = Dropout(0.2)(x)
+    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    out = Dense(1)(x)
+    return Model(inp, out, name='BiLSTM')
 
-    def fit(self, X, y, validation_data=None):
-        self.n_features = X.shape[1]
-        self.model = self._build_model()
-        X_res = np.array(X).reshape((-1, 1, self.n_features))
-        
-        v_data = None
-        if validation_data:
-            vx, vy = validation_data
-            v_data = (np.array(vx).reshape((-1, 1, self.n_features)), vy)
+def build_gru(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = GRU(32, return_sequences=True)(inp)
+    x = Dropout(0.2)(x)
+    x = GRU(16)(x)
+    x = Dropout(0.2)(x)
+    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    out = Dense(1)(x)
+    return Model(inp, out, name='GRU')
 
-        cbs = [
-            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
-        ]
-        
-        h = self.model.fit(X_res, y, epochs=self.epochs, batch_size=self.batch_size, 
-                          verbose=0, validation_data=v_data, callbacks=cbs)
-        self.history_ = h.history
-        return self
+def build_cnn_lstm(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = Conv1D(32, kernel_size=min(3, seq_len), padding='same', activation='relu')(inp)
+    x = Dropout(0.2)(x)
+    x = LSTM(32, return_sequences=False)(x)
+    x = Dropout(0.2)(x)
+    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    out = Dense(1)(x)
+    return Model(inp, out, name='CNN-LSTM')
 
-    def predict(self, X):
-        X_res = np.array(X).reshape((-1, 1, self.n_features))
-        return self.model.predict(X_res, verbose=0).flatten()
+def build_transformer(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = Dense(32)(inp)
+    attn1 = MultiHeadAttention(num_heads=4, key_dim=8)(x, x)
+    x = LayerNormalization()(x + attn1)
+    ff1 = Dense(32, activation='relu')(x)
+    x = LayerNormalization()(x + ff1)
+    x = Dropout(0.2)(x)
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    out = Dense(1)(x)
+    return Model(inp, out, name='Transformer')
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if self.model:
-            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
-                self.model.save(tmp.name)
-                with open(tmp.name, 'rb') as f: state['model_bytes'] = f.read()
-            os.unlink(tmp.name)
-            del state['model']
-        return state
+def build_attention_lstm(seq_len, n_feat):
+    inp = Input(shape=(seq_len, n_feat))
+    x = LSTM(32, return_sequences=True)(inp)
+    x = Dropout(0.2)(x)
+    score = Dense(1, use_bias=False)(x)
+    weights = Softmax(axis=1)(score)
+    context = Multiply()([x, weights])
+    context = Lambda(lambda z: tf.reduce_sum(z, axis=1))(context)
+    out = Dense(16, activation='relu', kernel_regularizer='l2')(context)
+    out = Dense(1)(out)
+    model = Model(inp, out, name='Attention-LSTM')
+    attn_model = Model(inp, weights, name='Attention-LSTM-weights')
+    return model, attn_model
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if 'model_bytes' in state:
-            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
-                with open(tmp.name, 'wb') as f: f.write(self.model_bytes)
-                self.model = tf.keras.models.load_model(tmp.name)
-            os.unlink(tmp.name)
-            del self.model_bytes
+BUILDERS = {
+    'LSTM': build_lstm,
+    'BiLSTM': build_bilstm,
+    'GRU': build_gru,
+    'CNN-LSTM': build_cnn_lstm,
+    'Transformer': build_transformer,
+}
 
-class PerCropScaler:
-    """Standardizes target values independently for each crop."""
-    def __init__(self):
-        self.stats = {}
-
-    def fit(self, df):
-        for crop in df['Crop'].unique():
-            subset = df[df['Crop'] == crop]['Yield']
-            self.stats[crop] = {'mean': subset.mean(), 'std': max(subset.std(), 1e-6)}
-        return self
-
-    def transform(self, df):
-        out = df['Yield'].astype(float).values.copy()
-        crops = df['Crop'].values
-        for i in range(len(out)):
-            s = self.stats.get(crops[i], {'mean': 0, 'std': 1})
-            out[i] = (out[i] - s['mean']) / s['std']
-        return out
-
-    def inverse_transform(self, preds, crops):
-        out = np.zeros_like(preds)
-        for i in range(len(preds)):
-            s = self.stats.get(crops[i], {'mean': 0, 'std': 1})
-            out[i] = preds[i] * s['std'] + s['mean']
-        return out
-
-def main():
-    ensure_dirs()
-    print('='*72)
-    print('Self-Correcting High-Accuracy Training Pipeline')
-    print('='*72)
-
-    df = pd.read_csv(args.data_path)
-    le = LabelEncoder().fit(df['Crop'])
-    joblib.dump(le, CFG['preproc_dir']/'label_encoder.joblib')
-
-    df['Crop_encoded'] = le.transform(df['Crop'])
-    # Added robust features
-    df['Temp_Range'] = df['Max Temp'] - df['Min Temp']
-    df['Soil_NPK'] = df['Nitrogen'] + df['Phosphorus'] + df['Potassium']
+# ── Task for Parallel Execution ───────────────────────────────────────────
+def train_single_model_task(name, X_train_s, y_train, X_val_s, y_val, X_test_s, y_test, crops_test, n_feat):
+    # Set TF threading config for this process
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
     
-    feature_cols = BASE_FEATURES + ['Temp_Range', 'Soil_NPK']
-    joblib.dump(feature_cols, CFG['preproc_dir']/'feature_columns.joblib')
-
-    # Year-based split
-    years = sorted(df['Year'].unique())
-    train_y = years[:-4]
-    val_y = years[-4:-2]
-    test_y = years[-2:]
-
-    train_df = df[df['Year'].isin(train_y)]
-    val_df = df[df['Year'].isin(val_y)]
-    test_df = df[df['Year'].isin(test_y)]
-
-    sc = StandardScaler().fit(train_df[feature_cols])
-    joblib.dump(sc, CFG['preproc_dir']/'scaler.joblib')
-
-    # Per-crop target scaling
-    target_scaler = PerCropScaler().fit(train_df)
-    joblib.dump(target_scaler, CFG['preproc_dir']/'target_scaler.joblib')
-
-    X_train = sc.transform(train_df[feature_cols])
-    y_train = target_scaler.transform(train_df)
-    X_val = sc.transform(val_df[feature_cols])
-    y_val = target_scaler.transform(val_df)
-    X_test = sc.transform(test_df[feature_cols])
-    y_test = test_df['Yield'].values
-
-    detailed = []
-    summary = []
-
-    for name in MODEL_NAMES:
-        print(f'\nTraining {name}...')
-        t0 = time.time()
-        m = KerasRegressorWrapper(model_type=name, epochs=5 if args.quick else 100, n_features=len(feature_cols))
-        m.fit(X_train, y_train, validation_data=(X_val, y_val))
+    t0 = time.time()
+    tf.keras.backend.clear_session()
+    
+    if name == 'Attention-LSTM':
+        model, attn_model = build_attention_lstm(SEQ_LEN, n_feat)
+    else:
+        model = BUILDERS[name](SEQ_LEN, n_feat)
+    
+    ckpt_path = str(MODEL_DIR / f'{name}_best.keras')
+    cbs = [
+        EarlyStopping(monitor='val_loss', patience=40, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=1e-7),
+        ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True)
+    ]
+    
+    opt = tf.keras.optimizers.AdamW(learning_rate=0.0005, weight_decay=1e-4, clipnorm=1.0)
+    model.compile(optimizer=opt, loss=tf.keras.losses.Huber(delta=0.5), metrics=['mae'])
+    
+    h = model.fit(X_train_s, y_train, validation_data=(X_val, y_val), 
+                  epochs=300, batch_size=16, callbacks=cbs, verbose=0)
+    
+    elapsed = round(time.time() - t0, 2)
+    epochs_run = len(h.history['loss'])
+    
+    # Save
+    model.save(str(MODEL_DIR / f'{name}.keras'))
+    if name == 'Attention-LSTM':
+        attn_model.save(str(MODEL_DIR / 'Attention-LSTM-weights.keras'))
         
-        # Predict on normalized scale then invert
-        y_test_norm_pred = m.predict(X_test)
-        y_pred = target_scaler.inverse_transform(y_test_norm_pred, test_df['Crop'].values)
-        y_pred = np.clip(y_pred, 0, None)
+    pd.DataFrame({
+        'epoch': list(range(1, epochs_run + 1)),
+        'loss': h.history['loss'],
+        'val_loss': h.history.get('val_loss', [np.nan] * epochs_run),
+    }).to_csv(HIST_DIR / f'{name}_history.csv', index=False)
+    
+    # Predict & Metrics
+    y_pred_log = model.predict(X_test_s, verbose=0).flatten()
+    y_pred = np.expm1(y_pred_log).clip(0)
+    y_actual = np.expm1(y_test)
+    
+    r2 = r2_score(y_actual, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
+    mae = mean_absolute_error(y_actual, y_pred)
+    mape = np.mean(np.abs((y_actual - y_pred) / (y_actual + 1e-9))) * 100
+    
+    # Per-crop
+    detailed = []
+    for crop in sorted(np.unique(crops_test)):
+        mask = crops_test == crop
+        ya, yp = y_actual[mask], y_pred[mask]
+        cr2 = r2_score(ya, yp) if len(ya) > 1 else np.nan
+        detailed.append({
+            'Model': name, 'Crop': crop, 'R2': round(float(cr2), 4),
+            'MAE': round(float(mean_absolute_error(ya, yp)), 2),
+            'RMSE': round(float(np.sqrt(mean_squared_error(ya, yp))), 2),
+            'MAPE': round(float(np.mean(np.abs((ya - yp) / (ya + 1e-9))) * 100), 2)
+        })
+        pd.DataFrame({'Actual': ya, 'Predicted': yp, 'Model': name, 'Crop': crop}).to_csv(
+            PRED_DIR / f'{name}_{crop.replace(" ", "_")}_predictions.csv', index=False
+        )
 
-        elapsed = round(time.time() - t0, 2)
-        joblib.dump(m, CFG['model_dir']/f'{name}.joblib')
+    summary = {
+        'Model': name, 'R2': round(r2, 4), 'RMSE': round(rmse, 2),
+        'MAE': round(mae, 2), 'MAPE': round(mape, 2),
+        'Epochs': epochs_run, 'Total_Train_Time': elapsed
+    }
+    
+    print(f"Finished {name} in {elapsed}s (R2={r2:.4f})")
+    return summary, detailed, y_pred
 
-        # Metrics
-        overall_r2 = r2_score(y_test, y_pred)
-        print(f"  Overall R²: {overall_r2:.4f}")
+# ── Main ───────────────────────────────────────────────────────────────────
+def main():
+    t_start = time.time()
+    print('='*70)
+    print('Parallel Crop Yield Training — 6 DL Models')
+    print('='*70)
 
-        if m.history_:
-            pd.DataFrame(m.history_).to_csv(CFG['output_dir']/'histories'/f'{name}_history.csv', index=False)
+    df = pd.read_csv(DATA_PATH)
+    df = engineer_features(df)
+    avail = [c for c in CANDIDATE_FEATURES if c in df.columns]
+    
+    years = sorted(df['Year'].unique())
+    n = len(years)
+    test_yrs = years[int(n * 0.85):]
+    val_yrs = years[int(n * 0.70):int(n * 0.85)]
+    train_yrs = years[:int(n * 0.70)]
+    
+    selected = avail
+    joblib.dump(selected, PREPROC_DIR / 'selected_features.joblib')
+    X, y_raw, crops_arr, years_arr = make_sequences(df, selected, SEQ_LEN)
+    y = np.log1p(y_raw)
+    
+    train_val_mask = np.isin(years_arr, train_yrs + val_yrs)
+    X_tv, y_tv = X[train_val_mask], y[train_val_mask]
+    
+    tscv = TimeSeriesSplit(n_splits=2)
+    for tr_idx, val_idx in tscv.split(X_tv): pass
+    X_train, y_train = X_tv[tr_idx], y_tv[tr_idx]
+    X_val, y_val = X_tv[val_idx], y_tv[val_idx]
+    
+    te_mask = np.isin(years_arr, test_yrs)
+    X_test, y_test = X[te_mask], y[te_mask]
+    crops_test = crops_arr[te_mask]
+    
+    scaler = RobustScaler()
+    scaler.fit(X_train.reshape(-1, X_train.shape[-1]))
+    joblib.dump(scaler, PREPROC_DIR / 'scaler.joblib')
+    
+    def scale(arr):
+        sh = arr.shape
+        return scaler.transform(arr.reshape(-1, sh[-1])).reshape(sh)
+    
+    X_tr_s, X_va_s, X_te_s = scale(X_train), scale(X_val), scale(X_test)
+    
+    print(f"Starting parallel training on {len(MODEL_NAMES)} models...")
+    summary_rows, detailed_rows = [], []
+    all_preds = {}
 
-        for crop in sorted(test_df['Crop'].unique()):
-            mask = test_df['Crop'] == crop
-            r2 = r2_score(y_test[mask], y_pred[mask])
-            mae = mean_absolute_error(y_test[mask], y_pred[mask])
-            mape = np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100
-            
-            detailed.append({'Model': name, 'Crop': crop, 'R2': round(r2, 4), 'MAE': round(mae, 2), 'MAPE': round(mape, 2)})
-            
-            p_df = pd.DataFrame({'Actual': y_test[mask], 'Predicted': y_pred[mask], 'Model': name, 'Crop': crop})
-            p_df.to_csv(CFG['output_dir']/'predictions'/f'{name}_{crop.replace(" ", "_")}_predictions.csv', index=False)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=len(MODEL_NAMES)) as executor:
+        futures = {executor.submit(train_single_model_task, name, X_tr_s, y_train, X_va_s, y_val, X_te_s, y_test, crops_test, len(selected)): name for name in MODEL_NAMES}
+        for future in concurrent.futures.as_completed(futures):
+            res_summary, res_detailed, y_pred = future.result()
+            summary_rows.append(res_summary)
+            detailed_rows.extend(res_detailed)
+            all_preds[futures[future]] = y_pred
 
-        summary.append({'Model': name, 'Avg_R2': overall_r2, 'Total_Train_Time': elapsed, 'Composite': overall_r2})
+    pd.DataFrame(detailed_rows).to_csv(BASE / 'detailed_metrics.csv', index=False)
+    pd.DataFrame(summary_rows).to_csv(BASE / 'model_comparison.csv', index=False)
 
-    pd.DataFrame(detailed).to_csv(CFG['output_dir']/'detailed_metrics.csv', index=True)
-    pd.DataFrame(summary).to_csv(CFG['output_dir']/'model_comparison.csv', index=False)
-    print("\nTraining Complete. All crops normalized.")
+    total_min = round((time.time() - t_start) / 60, 1)
+    print('='*68)
+    print(f"Total training: {total_min} minutes")
+    print('='*68)
 
 if __name__ == '__main__':
     main()
