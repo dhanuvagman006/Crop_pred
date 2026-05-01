@@ -307,11 +307,10 @@ with tab1:
                     crop_enc = le.transform([selected_crop])[0]
                     input_feat = build_features(crop_enc, weather_vals, soil_vals, area_val)
                     
-                    if scaler:
-                        input_feat = scaler.transform(input_feat)
+                    model_input_feat = scaler.transform(input_feat) if scaler else input_feat
                     
                     seq_len = 5
-                    input_feat_3d = np.repeat(input_feat.reshape(1, 1, -1), seq_len, axis=1)
+                    input_feat_3d = np.repeat(model_input_feat.reshape(1, 1, -1), seq_len, axis=1)
                     
                     pred_yield = float(np.clip(model.predict(input_feat_3d)[0], 0, None))
                     pred_mode = 'model'
