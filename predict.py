@@ -5,13 +5,16 @@
 
 import numpy as np
 import os, sys
+import logging
+import joblib
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 from sklearn.base import BaseEstimator, RegressorMixin
+from feature_pipeline import TRAIN_FEATURES, build_feature_row, load_feature_metadata
 
 # Must define the same wrapper class for joblib to load it
 class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
-    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=20):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=22):
         self.model_type = model_type
         self.epochs = epochs
         self.batch_size = batch_size
@@ -25,31 +28,37 @@ class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
             with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
                 tmp.write(self.model_bytes)
                 tmp.flush()
-                self.model = tf.keras.models.load_model(tmp.name)
+                self.model = tf.keras.models.load_model(tmp.name, compile=False)
             os.unlink(tmp.name)
             del self.model_bytes
     def predict(self, X):
         X_res = np.array(X).reshape((-1, 1, self.n_features))
         return self.model.predict(X_res, verbose=0).flatten()
 
-CROPS       = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
-MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
-CROP_BASE   = {'Rice':2.4,'Coconut':10.0,'Arecanut':7.2,'Banana':9.1,'Black pepper':2.6, 'Cocoa':0.6, 'Cashewnut':0.5, 'Mango':4.2}
-CROP_UNITS  = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha','Banana':'tonnes/ha','Black pepper':'tonnes/ha','Cocoa':'tonnes/ha','Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
+CROPS_DEFAULT = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+_le_path = os.path.join('outputs', 'preprocessors', 'label_encoder.joblib')
+if os.path.exists(_le_path):
+    try:
+        _le = joblib.load(_le_path)
+        CROPS = [str(c) for c in _le.classes_]
+    except Exception:
+        CROPS = CROPS_DEFAULT
+else:
+    CROPS = CROPS_DEFAULT
+MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
+CROP_BASE   = {'Rice':2.4,'Coconut':10.0,'Arecanut':7.2,'Banana':9.1,'Black Pepper':2.6}
+CROP_UNITS  = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha','Banana':'tonnes/ha','Black Pepper':'tonnes/ha'}
+SEQ_LEN = 5
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def build_features(crop_enc, weather, soil, area):
-    return np.array([[
-        weather['rainfall'], weather['max_temp'], weather['min_temp'],
-        weather['humidity'], weather['sunshine'], weather['wind'],
-        soil['ph'], soil['nitrogen'], soil['phosphorus'], soil['potassium'],
-        soil['organic_carbon'], soil['moisture'], soil['ec'], area, float(crop_enc),
-        weather['max_temp'] - weather['min_temp'],
-        weather['rainfall'] / max(weather['humidity'], 1e-6),
-        soil['nitrogen'] + soil['phosphorus'] + soil['potassium'],
-        np.log1p(area),
-        weather['rainfall'] * weather['humidity'] / 100.0,
-    ]], dtype=float)
+FEATURES_PATH = os.path.join('outputs', 'preprocessors', 'features.json')
+if os.path.exists(FEATURES_PATH):
+    FEATURE_ORDER, FEATURE_DEFAULTS = load_feature_metadata(FEATURES_PATH)
+else:
+    FEATURE_ORDER, FEATURE_DEFAULTS = TRAIN_FEATURES, {}
 
 def get_float(prompt, mn, mx, default):
     while True:
@@ -74,45 +83,74 @@ def get_choice(prompt, options):
         except ValueError:
             print("  Enter a valid number")
 
+def load_keras_model(model_path, model_name):
+    logger.info("Loading model: %s", model_path)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    model = tf.keras.models.load_model(model_path, compile=False)
+    logger.info("Loaded model: %s", model_name)
+    return model
+
+
 def predict(crop, model_name, weather, soil, area):
-    import joblib
-    
     # Paths
     base_path = os.path.join('outputs', 'preprocessors')
     le_path   = os.path.join(base_path, 'label_encoder.joblib')
     model_path = os.path.join('outputs', 'models', f"{model_name}.joblib")
+    keras_path = os.path.join('outputs', 'models', f"{model_name}.keras")
+    keras_best_path = os.path.join('outputs', 'models', f"{model_name}_best.keras")
+    if not os.path.exists(le_path):
+        raise FileNotFoundError(f"Label encoder not found: {le_path}")
+    if not (os.path.exists(keras_best_path) or os.path.exists(keras_path) or os.path.exists(model_path)):
+        raise FileNotFoundError(
+            f"No model found for {model_name}. Checked: {keras_best_path}, {keras_path}, {model_path}"
+        )
 
-    # Fallback formula params
-    base_formula = CROP_BASE[crop]
-    rain_eff = (weather['rainfall'] - 3500) / 3500 * 0.15
-    temp_eff = -(weather['max_temp'] - 32.5) * 0.02
-    n_eff    = (soil['nitrogen'] - 210) / 210 * 0.08
-    ph_eff   = -(abs(soil['ph'] - 6.0)) * 0.03
-    m_eff    = (soil['moisture'] - 32) / 32 * 0.04
-    pred_formula = max(50.0, base_formula * (1 + rain_eff + temp_eff + n_eff + ph_eff + m_eff))
-
-    if all(os.path.exists(p) for p in [le_path, model_path]):
-        try:
-            le = joblib.load(le_path)
+    try:
+        le = joblib.load(le_path)
+        if os.path.exists(keras_best_path) or os.path.exists(keras_path):
+            chosen_path = keras_best_path if os.path.exists(keras_best_path) else keras_path
+            model = load_keras_model(chosen_path, model_name)
+        else:
+            logger.info("Loading joblib model: %s", model_path)
             model = joblib.load(model_path)
-            
-            scaler_path = os.path.join(base_path, 'scaler.joblib')
-            scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
-            
-            crop_enc = le.transform([crop])[0]
-            features = build_features(crop_enc, weather, soil, area)
-            
-            if scaler:
-                features = scaler.transform(features)
-                
-            pred_val = float(np.clip(model.predict(features)[0], 0, None))
-            
-            return max(50.0, float(pred_val)), 'model'
-        except Exception as e:
-            print(f"  [Warning: Model error: {e}]")
-            pass
 
-    return pred_formula + np.random.normal(0, base_formula*0.03), 'formula'
+        scaler_path = os.path.join(base_path, 'scaler.joblib')
+        scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+
+        crop_enc = le.transform([crop])[0]
+        weather_map = {
+            'Rainfall': weather['rainfall'],
+            'Max Temp': weather['max_temp'],
+            'Min Temp': weather['min_temp'],
+            'Humidity': weather['humidity'],
+            'Sunshine': weather['sunshine'],
+            'Wind Speed': weather['wind'],
+        }
+        soil_map = {
+            'Soil pH': soil['ph'],
+            'Nitrogen': soil['nitrogen'],
+            'Phosphorus': soil['phosphorus'],
+            'Potassium': soil['potassium'],
+            'Organic Carbon': soil['organic_carbon'],
+            'Soil Moisture': soil['moisture'],
+            'EC': soil['ec'],
+        }
+        features = build_feature_row(
+            weather_map, soil_map, area, crop_enc, defaults=FEATURE_DEFAULTS
+        )
+
+        if scaler:
+            features = scaler.transform(features)
+
+        input_3d = np.repeat(features.reshape(1, 1, -1), SEQ_LEN, axis=1)
+        raw_pred = model.predict(input_3d, verbose=0)
+        pred_val = float(np.clip(np.squeeze(raw_pred), 0, None))
+
+        return max(0.0, float(pred_val)), 'model'
+    except Exception as e:
+        logger.error("Model load/predict failed for %s: %s", model_name, e)
+        raise
 
 def main():
     print("\n" + "="*60)
@@ -157,20 +195,19 @@ def main():
         print(f"  Predicted Yield : {pred_yield:>10,.1f}  {CROP_UNITS[crop]}")
         print(f"  Est. Production : {total_prod:>10,.1f}  tonnes")
         print(f"  Area            : {area:>10,.0f}  ha")
-        if mode == 'formula':
-            print("\n  [Note: Using formula-based estimation.")
-            print("   Train models first for deep learning predictions.]")
         print("="*60)
 
-        # All-model comparison
+        # All-model comparison using actual model outputs
         print("\n  -- All Models Comparison ---------------")
-        noise = {'LSTM': 0.97, 'BiLSTM': 1.01, 'GRU': 0.99, 'CNN-LSTM': 1.03, 'Transformer': 0.98, 'TCN': 0.96}
         for m in MODEL_NAMES:
-            y = max(50, pred_yield * noise.get(m, 1.0) + np.random.normal(0, pred_yield*0.02))
-            tag = " ← selected" if m == model_name else ""
-            bar_len = int(y / (max(CROP_BASE.values())/30))
-            bar = "#" * max(1, bar_len)
-            print(f"  {m:<14} {y:>8,.0f} {CROP_UNITS[crop]}  {bar}{tag}")
+            try:
+                y, _ = predict(crop, m, weather, soil, area)
+                tag = " ← selected" if m == model_name else ""
+                bar_len = int(y / (max(CROP_BASE.values()) / 30))
+                bar = "#" * max(1, bar_len)
+                print(f"  {m:<14} {y:>8,.0f} {CROP_UNITS[crop]}  {bar}{tag}")
+            except Exception as e:
+                print(f"  {m:<14} unavailable ({e})")
 
         again = input("\n  Predict again? (y/n): ").strip().lower()
         if again != 'y': break

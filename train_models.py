@@ -19,6 +19,7 @@ from tensorflow.keras.layers import (
     GlobalAveragePooling1D, Multiply, Softmax, Lambda
 )
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from feature_pipeline import TRAIN_FEATURES as SHARED_FEATURES, add_engineered_features, save_feature_metadata
 
 warnings.filterwarnings('ignore')
 tf.get_logger().setLevel('ERROR')
@@ -50,11 +51,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df['crop_encoded'] = le.fit_transform(df['Crop'])
     joblib.dump(le, PREPROC_DIR / 'label_encoder.joblib')
 
-    df['temp_range'] = df['Max Temp'] - df['Min Temp']
-    df['heat_stress_index'] = df['Max Temp'] * df['Humidity'] / 100
-    df['rainfall_intensity'] = df['Rainfall'] / 30
-    df['drought_index'] = 1 - (df['Rainfall'] / df['Rainfall'].max())
-    df['soil_ph_deviation'] = (df['Soil pH'] - 6.5).abs()
+    df = add_engineered_features(df)
 
     for crop in df['Crop'].unique():
         mask = df['Crop'] == crop
@@ -80,13 +77,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-CANDIDATE_FEATURES = [
-    'Rainfall', 'Max Temp', 'Min Temp', 'Humidity', 'Sunshine',
-    'Wind Speed', 'Soil pH', 'Nitrogen', 'Phosphorus', 'Potassium',
-    'Organic Carbon', 'Soil Moisture', 'EC', 'Area', 'crop_encoded',
-    'temp_range', 'heat_stress_index', 'drought_index',
-    'soil_ph_deviation', 'yield_lag1', 'yield_lag2', 'yield_rolling3'
-]
+TRAIN_FEATURES = SHARED_FEATURES
 
 def make_sequences(df: pd.DataFrame, feature_cols: list, seq_len: int = SEQ_LEN):
     X_list, y_list, crops_list, years_list = [], [], [], []
@@ -203,7 +194,7 @@ def train_single_model_task(name, X_train_s, y_train, X_val_s, y_val, X_test_s, 
     opt = tf.keras.optimizers.AdamW(learning_rate=0.0005, weight_decay=1e-4, clipnorm=1.0)
     model.compile(optimizer=opt, loss=tf.keras.losses.Huber(delta=0.5), metrics=['mae'])
     
-    h = model.fit(X_train_s, y_train, validation_data=(X_val, y_val), 
+    h = model.fit(X_train_s, y_train, validation_data=(X_val_s, y_val), 
                   epochs=300, batch_size=16, callbacks=cbs, verbose=0)
     
     elapsed = round(time.time() - t0, 2)
@@ -264,7 +255,7 @@ def main():
 
     df = pd.read_csv(DATA_PATH)
     df = engineer_features(df)
-    avail = [c for c in CANDIDATE_FEATURES if c in df.columns]
+    avail = [c for c in TRAIN_FEATURES if c in df.columns]
     
     years = sorted(df['Year'].unique())
     n = len(years)
@@ -272,8 +263,14 @@ def main():
     val_yrs = years[int(n * 0.70):int(n * 0.85)]
     train_yrs = years[:int(n * 0.70)]
     
-    selected = avail
+    selected = [c for c in TRAIN_FEATURES if c in df.columns]
+    if len(selected) != len(TRAIN_FEATURES):
+        missing = sorted(set(TRAIN_FEATURES) - set(selected))
+        raise ValueError(f"Missing required features for training/inference: {missing}")
     joblib.dump(selected, PREPROC_DIR / 'selected_features.joblib')
+    defaults = df[selected].mean(numeric_only=True).to_dict()
+    save_feature_metadata(PREPROC_DIR / 'features.json', selected, defaults)
+    print(f"Training features ({len(selected)}): {selected}")
     X, y_raw, crops_arr, years_arr = make_sequences(df, selected, SEQ_LEN)
     y = np.log1p(y_raw)
     

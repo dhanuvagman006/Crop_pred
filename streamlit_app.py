@@ -7,6 +7,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import os, joblib
+import logging
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
@@ -15,10 +16,11 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.base import BaseEstimator, RegressorMixin
 import tensorflow as tf
 import subprocess
+from feature_pipeline import TRAIN_FEATURES, build_feature_row, load_feature_metadata
 
 # Must define the same wrapper class for joblib to load it
 class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
-    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=20):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=22):
         self.model_type = model_type
         self.epochs = epochs
         self.batch_size = batch_size
@@ -32,7 +34,7 @@ class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
             with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp:
                 tmp.write(self.model_bytes)
                 tmp.flush()
-                self.model = tf.keras.models.load_model(tmp.name)
+                self.model = tf.keras.models.load_model(tmp.name, compile=False)
             os.unlink(tmp.name)
             del self.model_bytes
     def predict(self, X):
@@ -140,6 +142,17 @@ st.markdown("""
         color: #60a5fa !important;
         font-weight: 700;
     }
+
+    /* Crops Covered table styles */
+    .crops-table-wrapper { overflow-x: auto; margin-top: 0.5rem; }
+    .crops-table { width: 100%; border-collapse: collapse; min-width: 640px; }
+    .crops-table thead { background: #065f46; }
+    .crops-table th, .crops-table td { padding: 12px 16px; text-align: left; vertical-align: top; }
+    .crops-table th { color: #ffffff; font-size: 0.85rem; letter-spacing: 0.04em; }
+    .crops-table tbody tr:nth-child(odd) { background: #ffffff; }
+    .crops-table tbody tr:nth-child(even) { background: #f3f4f6; }
+    .crops-table td { color: #0f172a; }
+    .crops-table-wrapper.crops-card { border-radius: 12px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -152,13 +165,73 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ──────────────────────────────────────────────
-CROPS        = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black pepper', 'Cocoa', 'Cashewnut', 'Mango']
-MODEL_NAMES  = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'TCN']
+CROPS_DEFAULT = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+_le_path = os.path.join('outputs', 'preprocessors', 'label_encoder.joblib')
+if os.path.exists(_le_path):
+    try:
+        _le = joblib.load(_le_path)
+        CROPS = [str(c) for c in _le.classes_]
+    except Exception:
+        CROPS = CROPS_DEFAULT
+else:
+    CROPS = CROPS_DEFAULT
+MODEL_NAMES  = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
 CROP_UNITS   = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha',
-                'Banana':'tonnes/ha','Black pepper':'tonnes/ha','Cocoa':'tonnes/ha',
-                'Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
+                'Banana':'tonnes/ha','Black pepper':'tonnes/ha','Black Pepper':'tonnes/ha',
+                'Cocoa':'tonnes/ha','Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
 MODEL_COLORS = {'LSTM':'#2196F3','BiLSTM':'#4CAF50','GRU':'#FF9800',
-                'CNN-LSTM':'#9C27B0','Transformer':'#F44336','TCN':'#00BCD4'}
+                'CNN-LSTM':'#9C27B0','Transformer':'#F44336','Attention-LSTM':'#00BCD4'}
+SEQ_LEN = 5
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+CROPS_TABLE_HTML = """
+<div class="crops-table-wrapper crops-card">
+    <table class="crops-table">
+        <thead>
+            <tr>
+                <th>Crop</th>
+                <th>Season</th>
+                <th>Typical Yield Range (kg/ha)</th>
+                <th>Significance in DK</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Rice</td>
+                <td>Kharif</td>
+                <td>2,400 – 3,200</td>
+                <td>Primary food crop; major cultivation area</td>
+            </tr>
+            <tr>
+                <td>Coconut</td>
+                <td>Annual</td>
+                <td>8,500 – 10,000</td>
+                <td>Leading plantation crop of coastal Karnataka</td>
+            </tr>
+            <tr>
+                <td>Arecanut</td>
+                <td>Annual</td>
+                <td>1,800 – 2,400</td>
+                <td>High-value commercial crop; DK specialty</td>
+            </tr>
+            <tr>
+                <td>Banana</td>
+                <td>Annual</td>
+                <td>19,000 – 25,000</td>
+                <td>Important fruit crop; contributes to horticulture</td>
+            </tr>
+            <tr>
+                <td>Black Pepper</td>
+                <td>Annual</td>
+                <td>280 – 420</td>
+                <td>Traditional spice crop; high economic value</td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+"""
 
 COLUMN_MAP = {
     'avg_mape':   ['Avg_MAPE','MAPE','Test_MAPE','mape','avg_mape'],
@@ -184,20 +257,11 @@ def safe_col(df, *candidates):
 st.session_state.setdefault('selected_model', 'LSTM')
 st.session_state.setdefault('selected_crop', CROPS[0])
 
-
-def build_features(crop_enc, weather_vals, soil_vals, area_val):
-    return np.array([[
-        weather_vals['Annual_Rainfall_mm'], weather_vals['Max_Temp_C'], weather_vals['Min_Temp_C'],
-        weather_vals['Avg_Humidity_pct'], weather_vals['Sunshine_Hours_day'], weather_vals['Wind_Speed_kmh'],
-        soil_vals['Soil_pH'], soil_vals['Nitrogen_kg_ha'], soil_vals['Phosphorus_kg_ha'],
-        soil_vals['Potassium_kg_ha'], soil_vals['Organic_Carbon_pct'], soil_vals['Soil_Moisture_pct'],
-        soil_vals['EC_dSm'], area_val, float(crop_enc),
-        weather_vals['Max_Temp_C'] - weather_vals['Min_Temp_C'],
-        weather_vals['Annual_Rainfall_mm'] / max(weather_vals['Avg_Humidity_pct'], 1e-6),
-        soil_vals['Nitrogen_kg_ha'] + soil_vals['Phosphorus_kg_ha'] + soil_vals['Potassium_kg_ha'],
-        np.log1p(area_val),
-        weather_vals['Annual_Rainfall_mm'] * weather_vals['Avg_Humidity_pct'] / 100.0,
-    ]], dtype=float)
+FEATURES_PATH = os.path.join('outputs', 'preprocessors', 'features.json')
+if os.path.exists(FEATURES_PATH):
+    FEATURE_ORDER, FEATURE_DEFAULTS = load_feature_metadata(FEATURES_PATH)
+else:
+    FEATURE_ORDER, FEATURE_DEFAULTS = TRAIN_FEATURES, {}
 
 # Realistic ranges for Dakshina Kannada
 PARAM_INFO = {
@@ -222,15 +286,16 @@ with st.sidebar:
     st.markdown("### Prediction Settings")
     selected_crop  = st.selectbox("Select Crop", CROPS)
     selected_model = st.selectbox("Select DL Model", MODEL_NAMES)
+    debug_mode = st.checkbox("Debug logs", value=False)
     st.markdown("---")
     st.markdown("### About Models")
     model_desc = {
-        'LSTM':        'Long Short-Term Memory — captures long-range temporal patterns',
-        'BiLSTM':      'Bidirectional LSTM — reads sequence forward & backward',
-        'GRU':         'Gated Recurrent Unit — faster, fewer parameters than LSTM',
-        'CNN-LSTM':    'CNN + LSTM hybrid — extracts local + temporal features',
-        'Transformer': 'Attention-based — captures global dependencies',
-        'TCN':         'Temporal Convolutional Network — uses dilated causal convolutions',
+        'LSTM':           'Long Short-Term Memory — captures long-range temporal patterns',
+        'BiLSTM':         'Bidirectional LSTM — reads sequence forward & backward',
+        'GRU':            'Gated Recurrent Unit — faster, fewer parameters than LSTM',
+        'CNN-LSTM':       'CNN + LSTM hybrid — extracts local + temporal features',
+        'Transformer':    'Attention-based — captures global dependencies',
+        'Attention-LSTM': 'LSTM with attention — focuses on key timesteps',
     }
     st.info(model_desc[selected_model])
     st.markdown("---")
@@ -244,6 +309,10 @@ with st.sidebar:
     st.markdown("**Metrics:** R², MAE, RMSE, MAPE")
 
 # ── Main Layout ─────────────────────────────────────────────
+st.markdown("### 3.2 Crops Covered")
+st.markdown(CROPS_TABLE_HTML, unsafe_allow_html=True)
+st.markdown("---")
+
 tab1, tab2, tab3 = st.tabs(["Predict Yield", "Model Comparison", "About"])
 
 # ── TAB 1: Prediction ──────────────────────────────────────
@@ -283,6 +352,27 @@ with tab1:
             help=area_p['help'], key="area"
         )
 
+    weather_map = {
+        'Rainfall': weather_vals['Annual_Rainfall_mm'],
+        'Max Temp': weather_vals['Max_Temp_C'],
+        'Min Temp': weather_vals['Min_Temp_C'],
+        'Humidity': weather_vals['Avg_Humidity_pct'],
+        'Sunshine': weather_vals['Sunshine_Hours_day'],
+        'Wind Speed': weather_vals['Wind_Speed_kmh'],
+    }
+    soil_map = {
+        'Soil pH': soil_vals['Soil_pH'],
+        'Nitrogen': soil_vals['Nitrogen_kg_ha'],
+        'Phosphorus': soil_vals['Phosphorus_kg_ha'],
+        'Potassium': soil_vals['Potassium_kg_ha'],
+        'Organic Carbon': soil_vals['Organic_Carbon_pct'],
+        'Soil Moisture': soil_vals['Soil_Moisture_pct'],
+        'EC': soil_vals['EC_dSm'],
+    }
+    input_feat = build_feature_row(
+        weather_map, soil_map, area_val, CROPS.index(selected_crop), defaults=FEATURE_DEFAULTS
+    )
+
     st.markdown("---")
     predict_btn = st.button("Predict Yield Now")
 
@@ -292,35 +382,61 @@ with tab1:
             base_path = os.path.join('outputs', 'preprocessors')
             le_path   = os.path.join(base_path, 'label_encoder.joblib')
             model_path = os.path.join('outputs', 'models', f"{selected_model}.keras")
+            best_model_path = os.path.join('outputs', 'models', f"{selected_model}_best.keras")
+            if not os.path.exists(le_path):
+                st.error(f"Missing label encoder: {le_path}")
+                st.stop()
+            if not (os.path.exists(best_model_path) or os.path.exists(model_path)):
+                st.error(f"Missing model file: {best_model_path} or {model_path}")
+                st.stop()
 
-            pred_mode = 'formula'
-            pred_yield = 0.0
+            pred_mode = 'model'
+            try:
+                le = joblib.load(le_path)
+                chosen_path = best_model_path if os.path.exists(best_model_path) else model_path
+                logger.info("Loading model: %s", chosen_path)
+                model = tf.keras.models.load_model(chosen_path, compile=False)
 
-            if all(os.path.exists(p) for p in [le_path, model_path]):
-                try:
-                    le = joblib.load(le_path)
-                    model = tf.keras.models.load_model(model_path)
-                    
-                    scaler_path = os.path.join(base_path, 'scaler.joblib')
-                    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
-                    
-                    crop_enc = le.transform([selected_crop])[0]
-                    input_feat = build_features(crop_enc, weather_vals, soil_vals, area_val)
-                    
-                    model_input_feat = scaler.transform(input_feat) if scaler else input_feat
-                    
-                    seq_len = 5
-                    input_feat_3d = np.repeat(model_input_feat.reshape(1, 1, -1), seq_len, axis=1)
-                    
-                    pred_yield = float(np.clip(model.predict(input_feat_3d)[0], 0, None))
-                    pred_mode = 'model'
-                except Exception as e:
-                    st.error(f"Could not load {selected_model}: {e}")
-                    # fallback handled below
+                scaler_path = os.path.join(base_path, 'scaler.joblib')
+                scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+
+                crop_enc = le.transform([selected_crop])[0]
+                input_feat = build_feature_row(
+                    weather_map, soil_map, area_val, crop_enc, defaults=FEATURE_DEFAULTS
+                )
+
+                model_input_feat = scaler.transform(input_feat) if scaler else input_feat
+
+                input_feat_3d = np.repeat(model_input_feat.reshape(1, 1, -1), SEQ_LEN, axis=1)
+
+                raw_pred = model.predict(input_feat_3d, verbose=0)
+                pred_yield = float(np.clip(np.squeeze(raw_pred), 0, None))
+                pred_mode = 'model'
+
+                if debug_mode:
+                    st.markdown("#### Debug Logs")
+                    st.json({
+                        "crop": selected_crop,
+                        "model": selected_model,
+                        "crop_enc": int(crop_enc),
+                        "rainfall": weather_vals["Annual_Rainfall_mm"],
+                        "soil_moisture": soil_vals["Soil_Moisture_pct"],
+                        "area": area_val,
+                    })
+                    st.code(f"feature_order: {FEATURE_ORDER}")
+                    st.code(f"input_feat: {np.array2string(input_feat, precision=4, separator=', ')}")
+                    st.code(f"model_input_feat: {np.array2string(model_input_feat, precision=4, separator=', ')}")
+                    st.code(f"input_feat_3d shape: {input_feat_3d.shape}")
+                    st.code(f"raw_pred: {raw_pred}")
+                    st.code(f"pred_yield (post-clip): {pred_yield}")
+            except Exception as e:
+                logger.error("Model load/predict failed for %s: %s", selected_model, e)
+                st.error(f"Could not load {selected_model}: {e}")
+                st.stop()
             
             # Base factors for sensitivity calculations
             # Base factors for sensitivity calculations (tonnes/ha)
-            crop_base = {'Rice': 2.4, 'Coconut': 10.0, 'Arecanut': 7.2, 'Banana': 9.1, 'Black pepper': 2.6, 'Cocoa': 0.6, 'Cashewnut': 0.5, 'Mango': 4.2}
+            crop_base = {'Rice': 2.4, 'Coconut': 10.0, 'Arecanut': 7.2, 'Banana': 9.1, 'Black Pepper': 2.6}
             base = crop_base[selected_crop]
             
             rain_eff  = (weather_vals['Annual_Rainfall_mm'] - 3500) / 3500 * 0.15
@@ -329,9 +445,9 @@ with tab1:
             ph_eff    = -(abs(soil_vals['Soil_pH'] - 6.0)) * 0.03
             moist_eff = (soil_vals['Soil_Moisture_pct'] - 32) / 32 * 0.04
 
-            if pred_mode == 'formula':
-                pred_yield = base * (1 + rain_eff + temp_eff + n_eff + ph_eff + moist_eff)
-                pred_yield = max(50, pred_yield + np.random.normal(0, base*0.03))
+            if pred_mode != 'model':
+                st.error("Prediction failed: model output not available.")
+                st.stop()
 
             total_prod = pred_yield * area_val / 1000
 
@@ -371,7 +487,7 @@ with tab1:
                 t = -(v - 32.5)*0.02     if 'Temp' in param    else temp_eff
                 n = (v - 210)/210*0.08   if 'Nitrogen' in param else n_eff
                 y = base * (1 + r + t + n + ph_eff + moist_eff)
-                yields.append(max(50, y))
+                yields.append(max(0.0, y))
             ax.plot(vals, yields, color=MODEL_COLORS[selected_model], lw=2.5)
             ax.axvline(input_feat[0][list(PARAM_INFO.keys()).index(param)
                        if param in PARAM_INFO else 0],
@@ -387,30 +503,49 @@ with tab1:
         st.pyplot(fig)
         plt.close()
 
-        # ── All-model comparison ─────────────────────────────
+        # ── All-model comparison (actual outputs) ────────────
         st.markdown("#### All Models Comparison")
-        noise = {'LSTM': 0.97, 'BiLSTM': 1.01, 'GRU': 0.99, 'CNN-LSTM': 1.03, 'Transformer': 0.98, 'TCN': 0.96}
-        model_preds = {m: pred_yield * noise.get(m, 1.0) + np.random.normal(0, base*0.02)
-                       for m in MODEL_NAMES}
-        fig2, ax2 = plt.subplots(figsize=(10, 4))
-        colors = [MODEL_COLORS[m] for m in MODEL_NAMES]
-        bars   = ax2.bar(MODEL_NAMES,
-                         [max(50, model_preds[m]) for m in MODEL_NAMES],
-                         color=colors, edgecolor='white', linewidth=1.5, zorder=3)
-        ax2.set_ylabel(f'Predicted Yield ({CROP_UNITS[selected_crop]})', fontsize=11)
-        ax2.set_title(f'All Models — {selected_crop} Yield Prediction', fontsize=12, fontweight='bold')
-        ax2.grid(True, axis='y', alpha=0.3, zorder=0)
-        ax2.set_facecolor('#FAFAFA')
-        for bar, m in zip(bars, MODEL_NAMES):
-            v = max(50, model_preds[m])
-            ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height()+base*0.005,
-                     f'{v:,.0f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
-            if m == selected_model:
-                bar.set_edgecolor('#FFD700')
-                bar.set_linewidth(3)
-        plt.tight_layout()
-        st.pyplot(fig2)
-        plt.close()
+        model_preds = {}
+        missing_models = []
+        for m in MODEL_NAMES:
+            try:
+                m_best = os.path.join('outputs', 'models', f"{m}_best.keras")
+                m_path = os.path.join('outputs', 'models', f"{m}.keras")
+                chosen = m_best if os.path.exists(m_best) else m_path
+                if not os.path.exists(chosen):
+                    raise FileNotFoundError(f"Missing model: {chosen}")
+                model_m = tf.keras.models.load_model(chosen, compile=False)
+                raw_pred_m = model_m.predict(input_feat_3d, verbose=0)
+                model_preds[m] = float(np.clip(np.squeeze(raw_pred_m), 0, None))
+            except Exception as e:
+                missing_models.append(f"{m} ({e})")
+
+        if not model_preds:
+            st.warning("No model predictions available for comparison.")
+        else:
+            ordered = [m for m in MODEL_NAMES if m in model_preds]
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
+            colors = [MODEL_COLORS[m] for m in ordered]
+            bars = ax2.bar(ordered,
+                           [model_preds[m] for m in ordered],
+                           color=colors, edgecolor='white', linewidth=1.5, zorder=3)
+            ax2.set_ylabel(f'Predicted Yield ({CROP_UNITS[selected_crop]})', fontsize=11)
+            ax2.set_title(f'All Models — {selected_crop} Yield Prediction', fontsize=12, fontweight='bold')
+            ax2.grid(True, axis='y', alpha=0.3, zorder=0)
+            ax2.set_facecolor('#FAFAFA')
+            for bar, m in zip(bars, ordered):
+                v = model_preds[m]
+                ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height()+base*0.005,
+                         f'{v:,.0f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                if m == selected_model:
+                    bar.set_edgecolor('#FFD700')
+                    bar.set_linewidth(3)
+            plt.tight_layout()
+            st.pyplot(fig2)
+            plt.close()
+
+        if missing_models:
+            st.info("Unavailable models:\n- " + "\n- ".join(missing_models))
 
 # ── TAB 2: Model Comparison ────────────────────────────────
 with tab2:
@@ -440,6 +575,7 @@ with tab2:
         df_comp = df_comp.sort_values(sort_col, ascending=False)
     except KeyError:
         df_comp = df_comp.sort_values('Accuracy %', ascending=False)
+    df_comp = df_comp.reset_index(drop=True)
         
     st.markdown("#### Model Rankings & Metrics")
     
@@ -456,7 +592,7 @@ with tab2:
         if 'Params' in df_comp.columns:
             display_cols.append('Params')
             
-        display_df = df_comp[display_cols].copy()
+        display_df = df_comp[display_cols].copy().reset_index(drop=True)
         
         new_cols = ['Model', 'Yield Accuracy (%)', 'R² Score', 'RMSE', 'MAE', 'Train Time / Epochs']
         if len(display_cols) > 6: new_cols.append('Parameters')
@@ -550,22 +686,19 @@ with tab3:
     st.markdown("### About This System")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("""
+                st.markdown("""
 **Project:** Crop Yield Prediction using Weather and Soil Parameters of Dakshina Kannada
+""")
 
-**Crops Covered:**
-- Rice (Kharif)
-- Coconut
-- Arecanut
-- Banana
-- Black Pepper
+                st.markdown(CROPS_TABLE_HTML, unsafe_allow_html=True)
 
+                st.markdown("""
 **Input Features (15 total):**
 - 6 Weather parameters
 - 7 Soil parameters
 - Area under cultivation
 - Crop type (encoded)
-        """)
+                """)
     with col2:
         st.markdown("""
 **Deep Learning Models:**
@@ -574,7 +707,7 @@ with tab3:
 - GRU — Gated Recurrent Unit
 - CNN-LSTM — Hybrid CNN + LSTM
 - Transformer — Attention-based
-- TCN — Temporal Convolutional Network
+- Attention-LSTM — LSTM with attention
 
 **Evaluation Metrics:**
 - R² — Coefficient of Determination
