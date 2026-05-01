@@ -31,6 +31,23 @@ def set_seeds(seed=42):
 
 set_seeds(42)
 
+# ── Loss/metrics tuned for MAPE on original scale ─────────────────────────
+HUBER_LOSS = tf.keras.losses.Huber(delta=0.5)
+
+def mape_on_original(y_true, y_pred):
+    y_true_o = tf.math.expm1(y_true)
+    y_pred_o = tf.math.expm1(y_pred)
+    denom = tf.maximum(tf.abs(y_true_o), 1e-6)
+    return tf.reduce_mean(tf.abs((y_true_o - y_pred_o) / denom)) * 100.0
+
+def build_huber_plus_mape_loss(mape_weight: float):
+    # Combine stable log-space Huber with original-scale MAPE for accuracy.
+    def loss(y_true, y_pred):
+        huber = HUBER_LOSS(y_true, y_pred)
+        mape = mape_on_original(y_true, y_pred) / 100.0
+        return (1.0 - mape_weight) * huber + mape_weight * mape
+    return loss
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE = Path('outputs')
 MODEL_DIR = BASE / 'models'
@@ -41,7 +58,7 @@ for d in [MODEL_DIR, PREPROC_DIR, HIST_DIR, PRED_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 DATA_PATH = 'DK_CropYield_Dataset.csv'
-SEQ_LEN = 5
+SEQ_LEN = 6
 MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
 
 # ── Feature Engineering ────────────────────────────────────────────────────
@@ -58,7 +75,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         lo, hi = df.loc[mask, 'Yield'].quantile([0.02, 0.98])
         df.loc[mask, 'Yield'] = df.loc[mask, 'Yield'].clip(lo, hi)
 
-    for col in ['yield_lag1', 'yield_lag2', 'yield_rolling3']:
+    for col in ['yield_lag1', 'yield_lag2', 'yield_lag3', 'yield_rolling3', 'yield_rolling5']:
         df[col] = np.nan
 
     for crop in df['Crop'].unique():
@@ -66,13 +83,17 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         grp = df.loc[mask].sort_values('Year')
         df.loc[grp.index, 'yield_lag1'] = grp['Yield'].shift(1).values
         df.loc[grp.index, 'yield_lag2'] = grp['Yield'].shift(2).values
+        df.loc[grp.index, 'yield_lag3'] = grp['Yield'].shift(3).values
         df.loc[grp.index, 'yield_rolling3'] = grp['Yield'].rolling(3).mean().values
+        df.loc[grp.index, 'yield_rolling5'] = grp['Yield'].rolling(5).mean().values
         gm = grp['Yield'].mean()
         df.loc[grp.index, 'yield_lag1'] = df.loc[grp.index, 'yield_lag1'].fillna(gm)
         df.loc[grp.index, 'yield_lag2'] = df.loc[grp.index, 'yield_lag2'].fillna(gm)
+        df.loc[grp.index, 'yield_lag3'] = df.loc[grp.index, 'yield_lag3'].fillna(gm)
         df.loc[grp.index, 'yield_rolling3'] = df.loc[grp.index, 'yield_rolling3'].fillna(gm)
+        df.loc[grp.index, 'yield_rolling5'] = df.loc[grp.index, 'yield_rolling5'].fillna(gm)
 
-    for col in ['yield_lag1', 'yield_lag2', 'yield_rolling3']:
+    for col in ['yield_lag1', 'yield_lag2', 'yield_lag3', 'yield_rolling3', 'yield_rolling5']:
         df[col] = np.log1p(df[col])
 
     return df
@@ -94,69 +115,93 @@ def make_sequences(df: pd.DataFrame, feature_cols: list, seq_len: int = SEQ_LEN)
     return (np.array(X_list), np.array(y_list),
             np.array(crops_list), np.array(years_list))
 
+MAPE_WEIGHT = 0.6
+
+def build_sample_weights(crops: np.ndarray) -> np.ndarray:
+    counts = pd.Series(crops).value_counts()
+    weights = 1.0 / counts[crops].values
+    weights = weights / np.mean(weights)
+    return weights.astype(np.float32)
+
 # ── Model builders ─────────────────────────────────────────────────────────
 def build_lstm(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = LSTM(32, return_sequences=True)(inp)
-    x = Dropout(0.2)(x)
-    x = LSTM(16)(x)
-    x = Dropout(0.2)(x)
-    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    x = LSTM(64, return_sequences=True)(inp)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = LSTM(32)(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = Dense(32, activation='relu', kernel_regularizer='l2')(x)
+    x = Dropout(0.1)(x)
     out = Dense(1)(x)
     return Model(inp, out, name='LSTM')
 
 def build_bilstm(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = Bidirectional(LSTM(32, return_sequences=True))(inp)
-    x = Dropout(0.2)(x)
-    x = Bidirectional(LSTM(16))(x)
-    x = Dropout(0.2)(x)
-    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    x = Bidirectional(LSTM(64, return_sequences=True))(inp)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = Bidirectional(LSTM(32))(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = Dense(32, activation='relu', kernel_regularizer='l2')(x)
+    x = Dropout(0.1)(x)
     out = Dense(1)(x)
     return Model(inp, out, name='BiLSTM')
 
 def build_gru(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = GRU(32, return_sequences=True)(inp)
-    x = Dropout(0.2)(x)
-    x = GRU(16)(x)
-    x = Dropout(0.2)(x)
-    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    x = GRU(64, return_sequences=True)(inp)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = GRU(32)(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = Dense(32, activation='relu', kernel_regularizer='l2')(x)
+    x = Dropout(0.1)(x)
     out = Dense(1)(x)
     return Model(inp, out, name='GRU')
 
 def build_cnn_lstm(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = Conv1D(32, kernel_size=min(3, seq_len), padding='same', activation='relu')(inp)
-    x = Dropout(0.2)(x)
+    x = Conv1D(64, kernel_size=min(3, seq_len), padding='same', activation='relu')(inp)
+    x = Dropout(0.25)(x)
     x = LSTM(32, return_sequences=False)(x)
-    x = Dropout(0.2)(x)
-    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
+    x = Dense(32, activation='relu', kernel_regularizer='l2')(x)
+    x = Dropout(0.1)(x)
     out = Dense(1)(x)
     return Model(inp, out, name='CNN-LSTM')
 
 def build_transformer(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = Dense(32)(inp)
-    attn1 = MultiHeadAttention(num_heads=4, key_dim=8)(x, x)
+    x = Dense(64)(inp)
+    attn1 = MultiHeadAttention(num_heads=4, key_dim=16, dropout=0.1)(x, x)
     x = LayerNormalization()(x + attn1)
-    ff1 = Dense(32, activation='relu')(x)
+    x = Dropout(0.2)(x)
+    ff1 = Dense(64, activation='relu')(x)
+    ff1 = Dropout(0.2)(ff1)
     x = LayerNormalization()(x + ff1)
     x = Dropout(0.2)(x)
     x = GlobalAveragePooling1D()(x)
-    x = Dense(16, activation='relu', kernel_regularizer='l2')(x)
+    x = Dense(32, activation='relu', kernel_regularizer='l2')(x)
+    x = Dropout(0.1)(x)
     out = Dense(1)(x)
     return Model(inp, out, name='Transformer')
 
 def build_attention_lstm(seq_len, n_feat):
     inp = Input(shape=(seq_len, n_feat))
-    x = LSTM(32, return_sequences=True)(inp)
-    x = Dropout(0.2)(x)
+    x = LSTM(64, return_sequences=True)(inp)
+    x = LayerNormalization()(x)
+    x = Dropout(0.25)(x)
     score = Dense(1, use_bias=False)(x)
     weights = Softmax(axis=1)(score)
     context = Multiply()([x, weights])
     context = Lambda(lambda z: tf.reduce_sum(z, axis=1))(context)
-    out = Dense(16, activation='relu', kernel_regularizer='l2')(context)
+    out = Dense(32, activation='relu', kernel_regularizer='l2')(context)
+    out = Dropout(0.1)(out)
     out = Dense(1)(out)
     model = Model(inp, out, name='Attention-LSTM')
     attn_model = Model(inp, weights, name='Attention-LSTM-weights')
@@ -171,7 +216,18 @@ BUILDERS = {
 }
 
 # ── Task for Parallel Execution ───────────────────────────────────────────
-def train_single_model_task(name, X_train_s, y_train, X_val_s, y_val, X_test_s, y_test, crops_test, n_feat):
+def train_single_model_task(
+    name,
+    X_train_s,
+    y_train,
+    sample_weight,
+    X_val_s,
+    y_val,
+    X_test_s,
+    y_test,
+    crops_test,
+    n_feat,
+):
     # Set TF threading config for this process
     tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
@@ -186,16 +242,16 @@ def train_single_model_task(name, X_train_s, y_train, X_val_s, y_val, X_test_s, 
     
     ckpt_path = str(MODEL_DIR / f'{name}_best.keras')
     cbs = [
-        EarlyStopping(monitor='val_loss', patience=40, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=1e-7),
-        ModelCheckpoint(ckpt_path, monitor='val_loss', save_best_only=True)
+        EarlyStopping(monitor='val_mape_on_original', patience=60, min_delta=0.02, mode='min', restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_mape_on_original', factor=0.5, patience=20, min_lr=2e-6, mode='min'),
+        ModelCheckpoint(ckpt_path, monitor='val_mape_on_original', mode='min', save_best_only=True)
     ]
-    
-    opt = tf.keras.optimizers.AdamW(learning_rate=0.0005, weight_decay=1e-4, clipnorm=1.0)
-    model.compile(optimizer=opt, loss=tf.keras.losses.Huber(delta=0.5), metrics=['mae'])
-    
-    h = model.fit(X_train_s, y_train, validation_data=(X_val_s, y_val), 
-                  epochs=300, batch_size=16, callbacks=cbs, verbose=0)
+
+    opt = tf.keras.optimizers.AdamW(learning_rate=4e-4, weight_decay=5e-5, clipnorm=1.0)
+    model.compile(optimizer=opt, loss=build_huber_plus_mape_loss(MAPE_WEIGHT), metrics=[mape_on_original])
+
+    h = model.fit(X_train_s, y_train, sample_weight=sample_weight, validation_data=(X_val_s, y_val),
+                  epochs=700, batch_size=16, callbacks=cbs, verbose=0)
     
     elapsed = round(time.time() - t0, 2)
     epochs_run = len(h.history['loss'])
@@ -276,15 +332,18 @@ def main():
     
     train_val_mask = np.isin(years_arr, train_yrs + val_yrs)
     X_tv, y_tv = X[train_val_mask], y[train_val_mask]
+    crops_tv = crops_arr[train_val_mask]
     
     tscv = TimeSeriesSplit(n_splits=2)
     for tr_idx, val_idx in tscv.split(X_tv): pass
     X_train, y_train = X_tv[tr_idx], y_tv[tr_idx]
     X_val, y_val = X_tv[val_idx], y_tv[val_idx]
+    crops_train = crops_tv[tr_idx]
     
     te_mask = np.isin(years_arr, test_yrs)
     X_test, y_test = X[te_mask], y[te_mask]
     crops_test = crops_arr[te_mask]
+
     
     scaler = RobustScaler()
     scaler.fit(X_train.reshape(-1, X_train.shape[-1]))
@@ -295,13 +354,29 @@ def main():
         return scaler.transform(arr.reshape(-1, sh[-1])).reshape(sh)
     
     X_tr_s, X_va_s, X_te_s = scale(X_train), scale(X_val), scale(X_test)
+    sample_weight = build_sample_weights(crops_train)
     
     print(f"Starting parallel training on {len(MODEL_NAMES)} models...")
     summary_rows, detailed_rows = [], []
     all_preds = {}
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=len(MODEL_NAMES)) as executor:
-        futures = {executor.submit(train_single_model_task, name, X_tr_s, y_train, X_va_s, y_val, X_te_s, y_test, crops_test, len(selected)): name for name in MODEL_NAMES}
+        futures = {
+            executor.submit(
+                train_single_model_task,
+                name,
+                X_tr_s,
+                y_train,
+                sample_weight,
+                X_va_s,
+                y_val,
+                X_te_s,
+                y_test,
+                crops_test,
+                len(selected),
+            ): name
+            for name in MODEL_NAMES
+        }
         for future in concurrent.futures.as_completed(futures):
             res_summary, res_detailed, y_pred = future.result()
             summary_rows.append(res_summary)

@@ -38,6 +38,24 @@ const CROPS: CropRow[] = [
     yield: '280 – 420',
     significance: 'Traditional spice crop; high economic value',
   },
+  {
+    crop: 'Cashewnut',
+    season: 'Annual',
+    yield: '800 – 1,200',
+    significance: 'Plantation crop; important for coastal livelihoods',
+  },
+  {
+    crop: 'Cocoa',
+    season: 'Annual',
+    yield: '800 – 1,200',
+    significance: 'Estate crop; shade-tolerant intercropping',
+  },
+  {
+    crop: 'Sweet Potato',
+    season: 'Rabi',
+    yield: '15,000 – 25,000',
+    significance: 'Root crop; emerging food and processing demand',
+  },
 ]
 
 type Props = {

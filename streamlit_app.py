@@ -20,7 +20,7 @@ from feature_pipeline import TRAIN_FEATURES, build_feature_row, load_feature_met
 
 # Must define the same wrapper class for joblib to load it
 class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
-    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=22):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=len(TRAIN_FEATURES)):
         self.model_type = model_type
         self.epochs = epochs
         self.batch_size = batch_size
@@ -165,23 +165,35 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Constants ──────────────────────────────────────────────
-CROPS_DEFAULT = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+CROPS_DEFAULT = ['Rice', 'Coconut', 'Cocoa', 'Arecanut', 'Banana', 'Black Pepper', 'Cashewnut', 'Sweet Potato']
 _le_path = os.path.join('outputs', 'preprocessors', 'label_encoder.joblib')
 if os.path.exists(_le_path):
     try:
         _le = joblib.load(_le_path)
-        CROPS = [str(c) for c in _le.classes_]
+        encoder_crops = [str(c) for c in _le.classes_]
+        CROPS = encoder_crops + [c for c in CROPS_DEFAULT if c not in encoder_crops]
     except Exception:
         CROPS = CROPS_DEFAULT
 else:
     CROPS = CROPS_DEFAULT
 MODEL_NAMES  = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
-CROP_UNITS   = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha',
-                'Banana':'tonnes/ha','Black pepper':'tonnes/ha','Black Pepper':'tonnes/ha',
-                'Cocoa':'tonnes/ha','Cashewnut':'tonnes/ha','Mango':'tonnes/ha'}
+CROP_UNITS   = {
+    'Rice': 'tonnes/ha',
+    'Coconut': '1000s nuts/ha',
+    'Cocoa': 'tonnes/ha',
+    'Arecanut': 'tonnes/ha',
+    'Banana': 'tonnes/ha',
+    'Black pepper': 'tonnes/ha',
+    'Black Pepper': 'tonnes/ha',
+    'Cocoa': 'tonnes/ha',
+    'Cashewnut': 'tonnes/ha',
+    'Mango': 'tonnes/ha',
+    'Sweet Potato': 'tonnes/ha',
+}
+CANONICAL_CROPS = {}
 MODEL_COLORS = {'LSTM':'#2196F3','BiLSTM':'#4CAF50','GRU':'#FF9800',
                 'CNN-LSTM':'#9C27B0','Transformer':'#F44336','Attention-LSTM':'#00BCD4'}
-SEQ_LEN = 5
+SEQ_LEN = 6
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -227,6 +239,24 @@ CROPS_TABLE_HTML = """
                 <td>Annual</td>
                 <td>280 – 420</td>
                 <td>Traditional spice crop; high economic value</td>
+            </tr>
+            <tr>
+                <td>Cashewnut</td>
+                <td>Annual</td>
+                <td>800 – 1,200</td>
+                <td>Plantation crop; important for coastal livelihoods</td>
+            </tr>
+            <tr>
+                <td>Cocoa</td>
+                <td>Annual</td>
+                <td>800 – 1,200</td>
+                <td>Estate crop; shade-tolerant intercropping</td>
+            </tr>
+            <tr>
+                <td>Sweet Potato</td>
+                <td>Rabi</td>
+                <td>15,000 – 25,000</td>
+                <td>Root crop; emerging food and processing demand</td>
             </tr>
         </tbody>
     </table>
@@ -300,9 +330,9 @@ with st.sidebar:
     st.info(model_desc[selected_model])
     st.markdown("---")
     st.success("✅ Models Loaded Successfully")
-    st.markdown("""
+    st.markdown(f"""
     **Region:** Dakshina Kannada  
-    **Crops:** 8 Major Varieties  
+    **Crops:** {len(CROPS)} Major Varieties  
     **Models:** 6 Deep Learning  
     **Data:** Research Dataset
     """)
@@ -369,10 +399,6 @@ with tab1:
         'Soil Moisture': soil_vals['Soil_Moisture_pct'],
         'EC': soil_vals['EC_dSm'],
     }
-    input_feat = build_feature_row(
-        weather_map, soil_map, area_val, CROPS.index(selected_crop), defaults=FEATURE_DEFAULTS
-    )
-
     st.markdown("---")
     predict_btn = st.button("Predict Yield Now")
 
@@ -391,8 +417,14 @@ with tab1:
                 st.stop()
 
             pred_mode = 'model'
+            crop_key = CANONICAL_CROPS.get(selected_crop, selected_crop)
             try:
                 le = joblib.load(le_path)
+                if crop_key not in le.classes_:
+                    st.error(
+                        f"Crop '{crop_key}' not found in trained label encoder. Retrain models with this crop."
+                    )
+                    st.stop()
                 chosen_path = best_model_path if os.path.exists(best_model_path) else model_path
                 logger.info("Loading model: %s", chosen_path)
                 model = tf.keras.models.load_model(chosen_path, compile=False)
@@ -400,7 +432,7 @@ with tab1:
                 scaler_path = os.path.join(base_path, 'scaler.joblib')
                 scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
-                crop_enc = le.transform([selected_crop])[0]
+                crop_enc = le.transform([crop_key])[0]
                 input_feat = build_feature_row(
                     weather_map, soil_map, area_val, crop_enc, defaults=FEATURE_DEFAULTS
                 )
@@ -410,7 +442,8 @@ with tab1:
                 input_feat_3d = np.repeat(model_input_feat.reshape(1, 1, -1), SEQ_LEN, axis=1)
 
                 raw_pred = model.predict(input_feat_3d, verbose=0)
-                pred_yield = float(np.clip(np.squeeze(raw_pred), 0, None))
+                pred_log = float(np.squeeze(raw_pred))
+                pred_yield = float(np.expm1(pred_log))
                 pred_mode = 'model'
 
                 if debug_mode:
@@ -428,7 +461,8 @@ with tab1:
                     st.code(f"model_input_feat: {np.array2string(model_input_feat, precision=4, separator=', ')}")
                     st.code(f"input_feat_3d shape: {input_feat_3d.shape}")
                     st.code(f"raw_pred: {raw_pred}")
-                    st.code(f"pred_yield (post-clip): {pred_yield}")
+                    st.code(f"pred_log: {pred_log}")
+                    st.code(f"pred_yield: {pred_yield}")
             except Exception as e:
                 logger.error("Model load/predict failed for %s: %s", selected_model, e)
                 st.error(f"Could not load {selected_model}: {e}")
@@ -436,8 +470,19 @@ with tab1:
             
             # Base factors for sensitivity calculations
             # Base factors for sensitivity calculations (tonnes/ha)
-            crop_base = {'Rice': 2.4, 'Coconut': 10.0, 'Arecanut': 7.2, 'Banana': 9.1, 'Black Pepper': 2.6}
-            base = crop_base[selected_crop]
+            crop_base = {
+                'Rice': 2.4,
+                'Coconut': 10.0,
+                'Arecanut': 7.2,
+                'Banana': 9.1,
+                'Black Pepper': 2.6,
+                'Black pepper': 2.6,
+                'Cashewnut': 1.0,
+                'Cocoa': 0.9,
+                'Mango': 8.0,
+                'Sweet Potato': 20.0,
+            }
+            base = crop_base[crop_key]
             
             rain_eff  = (weather_vals['Annual_Rainfall_mm'] - 3500) / 3500 * 0.15
             temp_eff  = -(weather_vals['Max_Temp_C'] - 32.5) * 0.02
@@ -456,7 +501,7 @@ with tab1:
         <div class="result-box">
             <h2 style="color:#60a5fa; margin:0; font-weight:300;">Estimated Yield</h2>
             <h1 style="color:#ffffff; font-size:4rem; margin:0.5rem 0; font-weight:700;">
-                {int(pred_yield):,} <span style="font-size:1.5rem; color:#94a3b8;">{CROP_UNITS[selected_crop]}</span>
+                {int(pred_yield):,} <span style="font-size:1.5rem; color:#94a3b8;">{CROP_UNITS[crop_key]}</span>
             </h1>
             <p style="color:#94a3b8; margin:0; font-size:1.1rem;">
                 Using <b>{pred_mode.upper()}</b> Engine · {selected_crop} · {selected_model}
@@ -516,7 +561,8 @@ with tab1:
                     raise FileNotFoundError(f"Missing model: {chosen}")
                 model_m = tf.keras.models.load_model(chosen, compile=False)
                 raw_pred_m = model_m.predict(input_feat_3d, verbose=0)
-                model_preds[m] = float(np.clip(np.squeeze(raw_pred_m), 0, None))
+                pred_log_m = float(np.squeeze(raw_pred_m))
+                model_preds[m] = float(np.expm1(pred_log_m))
             except Exception as e:
                 missing_models.append(f"{m} ({e})")
 
@@ -529,7 +575,7 @@ with tab1:
             bars = ax2.bar(ordered,
                            [model_preds[m] for m in ordered],
                            color=colors, edgecolor='white', linewidth=1.5, zorder=3)
-            ax2.set_ylabel(f'Predicted Yield ({CROP_UNITS[selected_crop]})', fontsize=11)
+            ax2.set_ylabel(f'Predicted Yield ({CROP_UNITS[crop_key]})', fontsize=11)
             ax2.set_title(f'All Models — {selected_crop} Yield Prediction', fontsize=12, fontweight='bold')
             ax2.grid(True, axis='y', alpha=0.3, zorder=0)
             ax2.set_facecolor('#FAFAFA')
@@ -562,12 +608,12 @@ with tab2:
         st.warning("model_comparison.csv not found. Train models first.")
         st.stop()
         
-    # Calculate Accuracy for display (using robust relative accuracy formula)
+    # Calculate Accuracy for display (simple MAPE-based percent)
     mape_col = next((c for c in df_comp.columns if 'MAPE' in c.upper()), None)
     if mape_col is None:
         st.error(f"No MAPE column found. Columns: {df_comp.columns.tolist()}")
         st.stop()
-    df_comp['Accuracy %'] = 100 / (1 + (df_comp[mape_col] / 100))
+    df_comp['Accuracy %'] = (100 - df_comp[mape_col]).clip(lower=0, upper=100)
     
     # Sort by R2 or Accuracy
     try:

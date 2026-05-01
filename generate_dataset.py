@@ -3,13 +3,16 @@ import numpy as np
 
 np.random.seed(42)
 
-crops = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+crops = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper', 'Cashewnut', 'Cocoa', 'Sweet Potato']
 base_yields = {
     'Rice': 8500,
     'Coconut': 30000,
     'Arecanut': 6700,
     'Banana': 70000,
-    'Black Pepper': 1000
+    'Black Pepper': 1000,
+    'Cashewnut': 1200,
+    'Cocoa': 1000,
+    'Sweet Potato': 18000,
 }
 
 years = list(range(1800, 2025))

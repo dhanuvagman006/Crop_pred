@@ -14,7 +14,7 @@ from feature_pipeline import TRAIN_FEATURES, build_feature_row, load_feature_met
 
 # Must define the same wrapper class for joblib to load it
 class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
-    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=22):
+    def __init__(self, model_type='LSTM', epochs=50, batch_size=64, n_features=len(TRAIN_FEATURES)):
         self.model_type = model_type
         self.epochs = epochs
         self.batch_size = batch_size
@@ -35,20 +35,44 @@ class KerasRegressorWrapper(BaseEstimator, RegressorMixin):
         X_res = np.array(X).reshape((-1, 1, self.n_features))
         return self.model.predict(X_res, verbose=0).flatten()
 
-CROPS_DEFAULT = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+CROPS_DEFAULT = ['Rice', 'Coconut', 'Cocoa', 'Arecanut', 'Banana', 'Black Pepper', 'Cashewnut', 'Sweet Potato']
 _le_path = os.path.join('outputs', 'preprocessors', 'label_encoder.joblib')
 if os.path.exists(_le_path):
     try:
         _le = joblib.load(_le_path)
-        CROPS = [str(c) for c in _le.classes_]
+        encoder_crops = [str(c) for c in _le.classes_]
+        CROPS = encoder_crops + [c for c in CROPS_DEFAULT if c not in encoder_crops]
     except Exception:
         CROPS = CROPS_DEFAULT
 else:
     CROPS = CROPS_DEFAULT
 MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
-CROP_BASE   = {'Rice':2.4,'Coconut':10.0,'Arecanut':7.2,'Banana':9.1,'Black Pepper':2.6}
-CROP_UNITS  = {'Rice':'tonnes/ha','Coconut':'1000s nuts/ha','Arecanut':'tonnes/ha','Banana':'tonnes/ha','Black Pepper':'tonnes/ha'}
-SEQ_LEN = 5
+CROP_BASE   = {
+    'Rice': 2.4,
+    'Coconut': 10.0,
+    'Cocoa': 0.9,
+    'Arecanut': 7.2,
+    'Banana': 9.1,
+    'Black Pepper': 2.6,
+    'Black pepper': 2.6,
+    'Cashewnut': 1.0,
+    'Sweet Potato': 20.0,
+    'Mango': 8.0,
+}
+CROP_UNITS  = {
+    'Rice': 'tonnes/ha',
+    'Coconut': '1000s nuts/ha',
+    'Cocoa': 'tonnes/ha',
+    'Arecanut': 'tonnes/ha',
+    'Banana': 'tonnes/ha',
+    'Black Pepper': 'tonnes/ha',
+    'Black pepper': 'tonnes/ha',
+    'Cashewnut': 'tonnes/ha',
+    'Sweet Potato': 'tonnes/ha',
+    'Mango': 'tonnes/ha',
+}
+CANONICAL_CROPS = {}
+SEQ_LEN = 6
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -118,7 +142,12 @@ def predict(crop, model_name, weather, soil, area):
         scaler_path = os.path.join(base_path, 'scaler.joblib')
         scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
-        crop_enc = le.transform([crop])[0]
+        crop_key = CANONICAL_CROPS.get(crop, crop)
+        if crop_key not in le.classes_:
+            raise ValueError(
+                f"Crop '{crop_key}' not found in trained label encoder. Retrain models with this crop."
+            )
+        crop_enc = le.transform([crop_key])[0]
         weather_map = {
             'Rainfall': weather['rainfall'],
             'Max Temp': weather['max_temp'],
@@ -145,9 +174,10 @@ def predict(crop, model_name, weather, soil, area):
 
         input_3d = np.repeat(features.reshape(1, 1, -1), SEQ_LEN, axis=1)
         raw_pred = model.predict(input_3d, verbose=0)
-        pred_val = float(np.clip(np.squeeze(raw_pred), 0, None))
+        pred_log = float(np.squeeze(raw_pred))
+        pred_yield = float(np.expm1(pred_log))
 
-        return max(0.0, float(pred_val)), 'model'
+        return max(0.0, pred_yield), 'model'
     except Exception as e:
         logger.error("Model load/predict failed for %s: %s", model_name, e)
         raise

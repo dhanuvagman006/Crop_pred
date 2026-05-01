@@ -22,7 +22,7 @@ PRED_DIR    = OUTPUT_DIR / 'predictions'
 MODEL_DIR   = OUTPUT_DIR / 'models'
 
 MODEL_NAMES = ['LSTM', 'BiLSTM', 'GRU', 'CNN-LSTM', 'Transformer', 'Attention-LSTM']
-CROPS       = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper']
+CROPS       = ['Rice', 'Coconut', 'Arecanut', 'Banana', 'Black Pepper', 'Cashewnut', 'Cocoa', 'Sweet Potato']
 
 PALETTE = {
     'LSTM':            '#2196F3',
@@ -33,7 +33,7 @@ PALETTE = {
     'Attention-LSTM':  '#00BCD4',
 }
 CROP_PALETTE = {c: col for c, col in zip(
-    CROPS, ['#E91E63', '#3F51B5', '#009688', '#FF5722', '#607D8B']
+    CROPS, ['#E91E63', '#3F51B5', '#009688', '#FF5722', '#607D8B', '#8BC34A', '#9C27B0', '#FFC107']
 )}
 
 DPI = 150
