@@ -723,13 +723,4 @@ with tab3:
     st.markdown("**Training:** Run `train_models.py` to retrain all 5 models on your dataset")
     st.markdown("**Best results:** Use real data from IMD, data.gov.in, and ICRISAT for production accuracy")
 
-    st.markdown("---")
-    st.markdown("#### CLI Predict Tester")
-    if st.button("Run predict.py as subprocess"):
-        result = subprocess.run(['python','predict.py'], capture_output=True, text=True, input="1\n1\n\n\n\n\n\n\n\n\n\n\n\n\n\nn\n")
-        if result.returncode != 0:
-            st.error(f"Prediction failed:\n{result.stderr}")
-        else:
-            st.success("Subprocess complete. See output below:")
-            st.code(result.stdout)
 
